@@ -16,14 +16,19 @@ import sys
 import os
 import time
 import math
+import random
 import threading
 from typing import Optional, List
 import pyray as rl
 
 # 自作モジュール
-from inkparser import CreatureState, InkProtocolParser, MORPH_NAMES, GEAR_NAMES, GEAR_NAMES_EN
+from inkparser import (
+    CreatureState, InkProtocolParser, MORPH_NAMES, GEAR_NAMES, GEAR_NAMES_EN,
+    stat_rank, condition_label, MORPH_TRAIT_APTITUDE
+)
 from voxel_art import ChimeraVoxelModel
 from virtual_eink import VirtualEInk
+from sound_effects import SoundManager
 
 try:
     import serial
@@ -47,6 +52,81 @@ COL_LINE      = rl.Color(42, 52, 70, 255)
 COL_BTN       = rl.Color(35, 45, 62, 255)
 COL_BTN_HOVER = rl.Color(55, 70, 95, 255)
 
+class TrainCutin:
+    """MF2風 トレーニング結果 3Dカットイン & パーティクル演出"""
+    def __init__(self):
+        self.active = False
+        self.timer = 0.0
+        self.duration = 2.4
+        self.res = ""       # "GREAT", "SUCCESS", "FAIL", "SLACK", "OVERWORK"
+        self.stat = ""      # "INT", "AGGR", "CURIO", "SOC"
+        self.gain = 0
+        self.particles: List[dict] = []
+
+    def trigger(self, res: str, stat: str, gain: int, sound_mgr: SoundManager):
+        self.active = True
+        self.timer = self.duration
+        self.res = res
+        self.stat = stat
+        self.gain = gain
+        self.particles.clear()
+
+        # サウンド & パーティクル生成
+        if res == "GREAT":
+            sound_mgr.play("train_great")
+            for _ in range(40):
+                ang = random.uniform(0, math.pi * 2)
+                spd = random.uniform(1.2, 3.5)
+                self.particles.append({
+                    "x": 0.0, "y": 1.2, "z": 0.0,
+                    "vx": math.cos(ang) * spd,
+                    "vy": random.uniform(1.5, 4.0),
+                    "vz": math.sin(ang) * spd,
+                    "col": rl.Color(255, random.choice([200, 220, 240]), random.choice([50, 100, 220]), 255),
+                    "life": 1.0, "size": random.uniform(0.04, 0.08)
+                })
+        elif res == "SUCCESS":
+            sound_mgr.play("train_success")
+            for _ in range(16):
+                ang = random.uniform(0, math.pi * 2)
+                spd = random.uniform(0.8, 2.0)
+                self.particles.append({
+                    "x": 0.0, "y": 1.0, "z": 0.0,
+                    "vx": math.cos(ang) * spd,
+                    "vy": random.uniform(1.0, 2.5),
+                    "vz": math.sin(ang) * spd,
+                    "col": rl.Color(80, 240, 150, 255),
+                    "life": 1.0, "size": 0.05
+                })
+        elif res == "FAIL":
+            sound_mgr.play("train_fail")
+            for _ in range(10):
+                self.particles.append({
+                    "x": random.uniform(-0.3, 0.3), "y": 1.3, "z": 0.2,
+                    "vx": random.uniform(-0.3, 0.3), "vy": random.uniform(-0.2, 0.4), "vz": 0.0,
+                    "col": rl.Color(120, 200, 255, 230),
+                    "life": 1.0, "size": 0.06
+                })
+        elif res == "SLACK":
+            sound_mgr.play("train_slack")
+        elif res == "OVERWORK":
+            sound_mgr.play("overwork_alarm")
+
+    def update(self, dt: float):
+        if not self.active:
+            return
+        self.timer -= dt
+        if self.timer <= 0:
+            self.active = False
+            self.particles.clear()
+            return
+        for p in self.particles:
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            p["z"] += p["vz"] * dt
+            p["vy"] -= 5.5 * dt
+            p["life"] = max(0.0, p["life"] - dt * 0.7)
+
 class SerialWorker:
     """バックグラウンドで ESP32-S3 とのシリアル通信を維持・自動再接続するスレッド"""
     def __init__(self, parser: InkProtocolParser, eink: VirtualEInk):
@@ -59,6 +139,7 @@ class SerialWorker:
         self.lock = threading.Lock()
         self.tx_queue: List[str] = []
         self.log_lines: List[str] = []
+        self.event_queue: List[dict] = []
 
     def start(self):
         t = threading.Thread(target=self._run, daemon=True)
@@ -68,6 +149,12 @@ class SerialWorker:
         with self.lock:
             self.tx_queue.append(cmd.strip() + "\n")
             self._add_log(f"> {cmd.strip()}")
+
+    def pop_events(self) -> List[dict]:
+        with self.lock:
+            evts = list(self.event_queue)
+            self.event_queue.clear()
+            return evts
 
     def _add_log(self, text: str):
         self.log_lines.append(text)
@@ -102,6 +189,8 @@ class SerialWorker:
                         self.port_name = target_port
                         self.connected = True
                         self._add_log(f"[ONLINE] Connected to {target_port}")
+                        with self.lock:
+                            self.event_queue.append({"type": "dock", "port": target_port})
                         # 初期同期コマンドの送信 (古い滞留コマンドは破棄)
                         with self.lock:
                             self.tx_queue.clear()
@@ -134,8 +223,11 @@ class SerialWorker:
                             if line:
                                 self._add_log(line)
                                 r = self.parser.parse_line(line)
-                                if r and r.get("type") == "event":
-                                    self.eink.push_log(r["event"], self.parser.state.age_sec)
+                                if r:
+                                    if r.get("type") == "event":
+                                        self.eink.push_log(r["event"], self.parser.state.age_sec)
+                                    with self.lock:
+                                        self.event_queue.append(r)
                     else:
                         self.connected = False
                         self.ser = None
@@ -146,6 +238,123 @@ class SerialWorker:
                     time.sleep(1.0)
 
             time.sleep(0.01)
+
+def draw_mf2_status_panel(state: CreatureState, x: int, y: int):
+    """左上 3Dテラリウム内 MF2能力値パネル (POW, INT, SPD, SKI & ランク & コンディション)"""
+    w = 230
+    h = 188
+    # 半透明サイバーパネル
+    rl.draw_rectangle_rounded(rl.Rectangle(x, y, w, h), 0.08, 4, rl.Color(16, 22, 32, 225))
+    rl.draw_rectangle_rounded_lines(rl.Rectangle(x, y, w, h), 0.08, 4, rl.Color(50, 68, 95, 255))
+
+    # ヘッダー
+    rl.draw_text("MONSTER STATUS", x + 12, y + 10, 13, COL_ACCENT)
+
+    # コンディション判定 (MF2風)
+    cond_text, cond_type = condition_label(state.energy, state.health, state.happiness)
+    if cond_type == "DANGER":
+        cond_col = rl.Color(255, 75, 75, 255)
+    elif cond_type == "WARN":
+        cond_col = rl.Color(255, 190, 60, 255)
+    elif cond_type == "PEAK":
+        cond_col = rl.Color(255, 225, 70, 255)
+    elif cond_type == "GOOD":
+        cond_col = rl.Color(90, 240, 150, 255)
+    else:
+        cond_col = COL_TXT_MAIN
+
+    rl.draw_text(cond_text, x + 12, y + 28, 12, cond_col)
+
+    # 適性情報 (現在の形態)
+    raw_species = state.species_id % 12
+    best_traits = MORPH_TRAIT_APTITUDE[raw_species] if 0 <= raw_species < 12 else (0, 1)
+
+    # 4大パラメータ (POW, INT, SPD, SKI)
+    traits = [
+        ("ちから (POW)", state.aggression, 1, rl.Color(255, 100, 100, 255)),
+        ("かしこさ (INT)", state.intelligence, 0, rl.Color(100, 190, 255, 255)),
+        ("すばやさ (SPD)", state.curiosity, 2, rl.Color(100, 255, 180, 255)),
+        ("めいちゅう (SKI)", state.sociability, 3, rl.Color(255, 220, 100, 255)),
+    ]
+
+    for i, (label, val, tid, bar_col) in enumerate(traits):
+        row_y = y + 52 + i * 32
+        rank = stat_rank(val)
+
+        # ランク色
+        if rank == "S": r_col = rl.Color(255, 215, 0, 255)
+        elif rank == "A": r_col = rl.Color(255, 110, 70, 255)
+        elif rank == "B": r_col = rl.Color(80, 190, 255, 255)
+        elif rank == "C": r_col = rl.Color(80, 220, 120, 255)
+        elif rank == "D": r_col = rl.Color(180, 210, 230, 255)
+        else: r_col = COL_TXT_DIM
+
+        # ラベル & 適性マーク [A] [B]
+        apt_mark = " [A]" if tid == best_traits[0] else (" [B]" if tid == best_traits[1] else "")
+        rl.draw_text(f"{label}{apt_mark}", x + 12, row_y, 11, COL_TXT_MAIN)
+
+        # バー背景
+        bar_x = x + 12
+        bar_y = row_y + 14
+        bar_w = 145
+        bar_h = 7
+        rl.draw_rectangle(bar_x, bar_y, bar_w, bar_h, rl.Color(35, 45, 60, 255))
+
+        # ゲージ
+        fill_w = int(bar_w * (min(100, max(0, val)) / 100.0))
+        rl.draw_rectangle(bar_x, bar_y, fill_w, bar_h, bar_col)
+
+        # 数値 & ランク
+        rl.draw_text(f"{val:3d}", x + 165, row_y + 9, 12, COL_TXT_MAIN)
+        rl.draw_text(rank, x + 198, row_y + 8, 14, r_col)
+
+def draw_cutin_banner(cutin: TrainCutin):
+    """3D領域上部にポップアップする MF2風カットインリザルトバナー"""
+    if not cutin.active:
+        return
+    progress = (cutin.duration - cutin.timer) / cutin.duration
+    alpha = 1.0 if progress < 0.75 else max(0.0, (1.0 - progress) / 0.25)
+    a_int = int(alpha * 255)
+
+    bx = 90
+    by = 180
+    bw = 470
+    bh = 80
+
+    if cutin.res == "GREAT":
+        title = "★ GREAT SUCCESS !! ★"
+        sub = f"{cutin.stat} +{cutin.gain} UP ! (Tremendous Growth!)"
+        col_border = rl.Color(255, 215, 0, a_int)
+        col_txt = rl.Color(255, 235, 120, a_int)
+    elif cutin.res == "SUCCESS":
+        title = "SUCCESS !"
+        sub = f"{cutin.stat} +{cutin.gain} UP !"
+        col_border = rl.Color(80, 240, 150, a_int)
+        col_txt = rl.Color(120, 255, 180, a_int)
+    elif cutin.res == "FAIL":
+        title = "FAIL..."
+        sub = "Wasted effort... (0 gain)"
+        col_border = rl.Color(100, 160, 240, a_int)
+        col_txt = rl.Color(160, 200, 255, a_int)
+    elif cutin.res == "SLACK":
+        title = "SLACK... (Playing Hooky)"
+        sub = "Took a little nap instead~"
+        col_border = rl.Color(255, 180, 80, a_int)
+        col_txt = rl.Color(255, 205, 120, a_int)
+    else:  # OVERWORK
+        title = "⚠ OVERWORK WARNING !! ⚠"
+        sub = "Dangerously exhausted! Rest immediately!"
+        col_border = rl.Color(255, 60, 60, a_int)
+        col_txt = rl.Color(255, 100, 100, a_int)
+
+    # バナー背景
+    rl.draw_rectangle_rounded(rl.Rectangle(bx, by, bw, bh), 0.2, 4, rl.Color(14, 18, 26, int(a_int * 0.92)))
+    rl.draw_rectangle_rounded_lines(rl.Rectangle(bx, by, bw, bh), 0.2, 4, col_border)
+
+    tw1 = rl.measure_text(title, 22)
+    rl.draw_text(title, bx + (bw - tw1) // 2, by + 16, 22, col_txt)
+    tw2 = rl.measure_text(sub, 15)
+    rl.draw_text(sub, bx + (bw - tw2) // 2, by + 46, 15, COL_TXT_MAIN)
 
 def main():
     # 1. Raylib ウィンドウ初期化
@@ -160,6 +369,11 @@ def main():
     eink = VirtualEInk()
     serial_worker = SerialWorker(parser, eink)
     serial_worker.start()
+
+    # 8-bit サウンドマネージャ & MF2カットイン演出
+    sound_mgr = SoundManager()
+    sound_mgr.init_audio()
+    train_cutin = TrainCutin()
 
     # デモ用の初期設定
     state.species_id = 24  # 第24世代ちびドラゴン (柴犬ピン耳 + 背中トゲ)
@@ -259,6 +473,21 @@ void main() {
         if click_bounce > 0:
             click_bounce = max(0.0, click_bounce - dt * 4.0)
 
+        # シリアルイベントの受信・ディスパッチ
+        for ev in serial_worker.pop_events():
+            etype = ev.get("type")
+            if etype == "dock":
+                sound_mgr.play("dock")
+                state.speech_bubble = f"PocketStation Docked! [{ev.get('port', 'COM')}]"
+                state.speech_timer = 4.0
+            elif etype == "train":
+                res = ev.get("res", "SUCCESS")
+                stat = ev.get("stat", "INT")
+                gain = ev.get("gain", 0)
+                train_cutin.trigger(res, stat, gain, sound_mgr)
+
+        train_cutin.update(dt)
+
         # マウス入力 & 3D カメラ制御
         mouse_pos = rl.get_mouse_position()
         in_3d_area = (mouse_pos.x < 650)  # 左側 3D 領域
@@ -295,6 +524,7 @@ void main() {
 
         # ボタン入力判定
         if rl.check_collision_point_rec(mouse_pos, btn_feed) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
             serial_worker.send("FEED")
             state.hunger = max(0, state.hunger - 30)
             state.happiness = min(100, state.happiness + 10)
@@ -303,6 +533,7 @@ void main() {
             state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_play) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
             serial_worker.send("PLAY")
             state.happiness = min(100, state.happiness + 15)
             state.energy = max(0, state.energy - 10)
@@ -311,32 +542,70 @@ void main() {
             state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_train) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
             serial_worker.send("TRAIN")
-            state.energy = max(0, state.energy - 18)
-            state.hunger = min(100, state.hunger + 12)
-            state.action = "PLAY"
-            state.speech_bubble = "Push it to the limit! Training hard!"
-            state.speech_timer = 3.5
+            # オフライン時 (シミュレータ時) はPC側でMF2ダイスロール & 即時カットイン
+            if not serial_worker.connected:
+                raw_sp = state.species_id % 12
+                best_t = MORPH_TRAIT_APTITUDE[raw_sp] if 0 <= raw_sp < 12 else (0, 1)
+                target = best_t[0] if random.random() < 0.7 else best_t[1]
+                t_names = ["INT", "POW", "SPD", "SKI"]
+                target_name = t_names[target]
+
+                if state.energy < 15:
+                    state.health = max(1, state.health - 5)
+                    train_cutin.trigger("OVERWORK", target_name, 0, sound_mgr)
+                    state.speech_bubble = "Too exhausted... Overworked!"
+                else:
+                    state.energy = max(0, state.energy - 18)
+                    state.hunger = min(100, state.hunger + 12)
+                    r = random.random()
+                    if r < 0.08:
+                        train_cutin.trigger("SLACK", target_name, 0, sound_mgr)
+                        state.speech_bubble = "Played hooky today~ (SLACK)"
+                    elif r < 0.28:
+                        gain = random.choice([3, 4])
+                        if target == 0: state.intelligence = min(100, state.intelligence + gain)
+                        elif target == 1: state.aggression = min(100, state.aggression + gain)
+                        elif target == 2: state.curiosity = min(100, state.curiosity + gain)
+                        elif target == 3: state.sociability = min(100, state.sociability + gain)
+                        train_cutin.trigger("GREAT", target_name, gain, sound_mgr)
+                        state.speech_bubble = f"GREAT SUCCESS !! {target_name} +{gain} UP!"
+                    elif r < 0.85:
+                        gain = random.choice([1, 2])
+                        if target == 0: state.intelligence = min(100, state.intelligence + gain)
+                        elif target == 1: state.aggression = min(100, state.aggression + gain)
+                        elif target == 2: state.curiosity = min(100, state.curiosity + gain)
+                        elif target == 3: state.sociability = min(100, state.sociability + gain)
+                        train_cutin.trigger("SUCCESS", target_name, gain, sound_mgr)
+                        state.speech_bubble = f"Training complete! {target_name} +{gain} UP!"
+                    else:
+                        train_cutin.trigger("FAIL", target_name, 0, sound_mgr)
+                        state.speech_bubble = "Couldn't make it this time... (FAIL)"
+                state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_time) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
             now_u = int(time.time())
             serial_worker.send(f"TIME {now_u}")
             state.speech_bubble = f"Host time synced: {now_u}"
             state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_reborn) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
             serial_worker.send("REBORN")
             state.speech_bubble = "Rebirth command sent! New generation awaits..."
             state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_photo) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
-            # スクリーンショット撮影
+            sound_mgr.play("click")
             fn = f"inklife_snap_{int(time.time())}.png"
             rl.take_screenshot(fn)
             screenshot_msg = f"Snapshot saved: {fn}"
             screenshot_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_bench) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
             serial_worker.send("BENCH")
 
         # 3D ボクセルモデルのビルド (キャッシュにより変化時のみ再生成)
@@ -422,12 +691,52 @@ void main() {
             rot_y = math.sin(sim_time * 0.9) * 8.0
 
         chimera_pos = rl.Vector3(0.0, 0.82 + hop_y + bounce_y, 0.0)
-        voxel_model.draw(chimera_pos, scale=1.0, rot_y=rot_y, breathe=sim_time)
+        # MF2 トレーニング・カットイン演出のモーション合成
+        cut_jump_y = 0.0
+        cut_squash_x = 1.0
+        cut_squash_y = 1.0
+        cut_rot_z = 0.0
+        if train_cutin.active:
+            prog = (train_cutin.duration - train_cutin.timer) / train_cutin.duration
+            if train_cutin.res == "GREAT":
+                # 大ジャンプ + 宙返りスピン
+                cut_jump_y = math.sin(prog * math.pi) * 1.65
+                rot_y += prog * 720.0
+                cut_squash_x = 1.0 - math.sin(prog * math.pi) * 0.18
+                cut_squash_y = 1.0 + math.sin(prog * math.pi) * 0.28
+            elif train_cutin.res == "SUCCESS":
+                # リズミカルな小ジャンプ
+                cut_jump_y = abs(math.sin(prog * math.pi * 3.0)) * 0.45
+            elif train_cutin.res == "FAIL":
+                # 前のめりにペタンと潰れる
+                cut_jump_y = -0.22
+                cut_squash_y = 0.52
+                cut_squash_x = 1.38
+            elif train_cutin.res == "SLACK":
+                # 横を向いてゴロンと寝る
+                cut_jump_y = -0.26
+                cut_rot_z = 75.0
+            elif train_cutin.res == "OVERWORK":
+                # 力尽きてガクッと倒れる
+                cut_jump_y = -0.32
+                cut_squash_y = 0.65
+                cut_rot_z = 40.0
+
+        chimera_pos = rl.Vector3(0.0, 0.82 + hop_y + bounce_y + cut_jump_y, 0.0)
+        voxel_model.draw(
+            chimera_pos, scale=1.0, rot_y=rot_y, breathe=sim_time,
+            squash_x=cut_squash_x, squash_y=cut_squash_y, rot_z=cut_rot_z
+        )
+
+        # MF2 カットイン・パーティクル (星屑 / 汗)
+        for p in train_cutin.particles:
+            p_col = rl.Color(p["col"].r, p["col"].g, p["col"].b, int(p["life"] * 255))
+            rl.draw_cube(rl.Vector3(p["x"], p["y"], p["z"]), p["size"], p["size"], p["size"], p_col)
 
         rl.end_shader_mode()
 
         # 台座上の動的ドロップシャドウ (高さ連動でふんわり減衰)
-        cur_h = hop_y + bounce_y
+        cur_h = hop_y + bounce_y + cut_jump_y
         shadow_scale = max(0.4, 0.85 - cur_h * 0.6)
         shadow_alpha = int(max(40, 160 - cur_h * 180))
         rl.draw_circle_3d(rl.Vector3(0, 0.032, 0), shadow_scale, rl.Vector3(1, 0, 0), 90.0, rl.Color(12, 16, 24, shadow_alpha))
@@ -486,8 +795,11 @@ void main() {
         rl.draw_circle(36, 80, 4, conn_col)
         rl.draw_text(conn_label, 46, 74, 11, conn_col)
 
-        # キメラの吹き出し (Speech Bubble)
-        if bubble_alpha > 0.05:
+        # 3D領域 右上: MF2風 能力値ステータスパネル (POW, INT, SPD, SKI & ランク & コンディション)
+        draw_mf2_status_panel(state, 395, 18)
+
+        # キメラの吹き出し (Speech Bubble: カットイン中は非表示)
+        if bubble_alpha > 0.05 and not train_cutin.active:
             bub_text = state.speech_bubble
             tw = rl.measure_text(bub_text, 16)
             bx = max(30, min(500 - tw, 325 - tw // 2))
@@ -507,6 +819,9 @@ void main() {
                 rl.Color(255, 255, 255, alpha_int)
             )
             rl.draw_text(bub_text, bx + 16, by + 12, 16, rl.Color(20, 24, 32, alpha_int))
+
+        # MF2 トレーニング・カットインバナー (画面中央ポップアップ)
+        draw_cutin_banner(train_cutin)
 
         # 左下: 3D 操作ヒント
         rl.draw_text("L-Drag: Orbit Camera | Wheel: Zoom | Click Chimera: Pet", 24, WIN_H - 28, 11, COL_TXT_DIM)
@@ -608,6 +923,7 @@ void main() {
 
     # 5. 終了処理
     serial_worker.running = False
+    sound_mgr.close()
     rl.unload_shader(lighting_shader)
     rl.unload_render_texture(rt_3d)
     eink.unload()

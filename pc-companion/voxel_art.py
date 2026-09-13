@@ -303,31 +303,42 @@ class ChimeraVoxelModel:
             return "ink_greet"
         return f"ink_m{raw:02d}_idle"
 
-    def draw(self, pos: rl.Vector3, scale: float, rot_y: float = 0.0, breathe: float = 0.0):
-        """Raylib 3D 空間にソリッド・ボクセルキメラを描画"""
+    def draw(self, pos: rl.Vector3, scale: float, rot_y: float = 0.0, breathe: float = 0.0,
+             squash_x: float = 1.0, squash_y: float = 1.0, rot_z: float = 0.0):
+        """Raylib 3D 空間にソリッド・ボクセルキメラを描画 (MF2アニメーション対応)"""
         if not self.voxels:
             return
 
-        # 呼吸モーション (ぷにっとした伸縮)
-        breathe_scale_y = 1.0 + math.sin(breathe * 3.0) * 0.04
-        breathe_scale_x = 1.0 - math.sin(breathe * 3.0) * 0.02
+        # 呼吸モーション (ぷにっとした伸縮) + 外的 squash/stretch
+        breathe_scale_y = (1.0 + math.sin(breathe * 3.0) * 0.04) * squash_y
+        breathe_scale_x = (1.0 - math.sin(breathe * 3.0) * 0.02) * squash_x
 
-        rad = math.radians(rot_y)
-        cos_r = math.cos(rad)
-        sin_r = math.sin(rad)
+        rad_y = math.radians(rot_y)
+        cos_y = math.cos(rad_y)
+        sin_y = math.sin(rad_y)
+
+        rad_z = math.radians(rot_z)
+        cos_z = math.cos(rad_z)
+        sin_z = math.sin(rad_z)
 
         for v in self.voxels:
-            # 呼吸と回転の座標変換
+            # 呼吸と伸縮
             lx = v.x * scale * breathe_scale_x
             ly = v.y * scale * breathe_scale_y
             lz = (v.z - v.d * 0.5) * scale
 
-            # Y軸回転
-            rx = lx * cos_r - lz * sin_r
-            rz = lx * sin_r + lz * cos_r
+            # Z軸回転 (roll: 横倒れ・ズコー)
+            zx = lx * cos_z - ly * sin_z
+            zy = lx * sin_z + ly * cos_z
+            zz = lz
+
+            # Y軸回転 (yaw)
+            rx = zx * cos_y - zz * sin_y
+            rz = zx * sin_y + zz * cos_y
+            ry = zy
 
             world_x = pos.x + rx
-            world_y = pos.y + ly
+            world_y = pos.y + ry
             world_z = pos.z + rz
 
             # 立体ボクセルキューブの描画

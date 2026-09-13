@@ -6,7 +6,7 @@ InkLife シリアルプロトコル解析 & 状態モデル
 """
 
 import re
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 # 形態マップ (species % 12 -> 5基本形態 mid)
 MORPH_5_MAP = [0, 1, 2, 1, 4, 2, 7, 7, 0, 1, 2, 0]
@@ -19,6 +19,43 @@ GEAR_NAMES_EN = [
     "Orb", "Horns", "Ears", "Spikes", "Stripes", "Halo",
     "Fin", "Crown", "Swirl", "Legs", "Whiskers", "Star"
 ]
+
+# 各形態のMF2トレーニング適性 [0]=最得意(A), [1]=第2適性(B) (0:INT, 1:AGGR, 2:CURIO, 3:SOC)
+MORPH_TRAIT_APTITUDE = [
+    (0, 3),  # 0: まる (スライム)   -> INT, SOC
+    (1, 2),  # 1: つの (ちびドラ)   -> AGGR, CURIO
+    (3, 0),  # 2: みみ (柴犬)       -> SOC, INT
+    (1, 2),  # 3: とげ (トゲドラ)   -> AGGR, CURIO
+    (2, 1),  # 4: しま (トラ猫)     -> CURIO, AGGR
+    (0, 2),  # 5: わっか (フクロウ) -> INT, CURIO
+    (2, 3),  # 6: ひれ (お魚)       -> CURIO, SOC
+    (3, 0),  # 7: おうかん (カエル) -> SOC, INT
+    (0, 3),  # 8: うず (カタツムリ) -> INT, SOC
+    (1, 0),  # 9: あし (ゴーレム)   -> AGGR, INT
+    (0, 2),  # 10: ひげ (狐)        -> INT, CURIO
+    (3, 2),  # 11: ほし (サンショウ)-> SOC, CURIO
+]
+
+def stat_rank(val: int) -> str:
+    """MF2風の能力値ランク (E..S)"""
+    if val >= 85: return "S"
+    if val >= 70: return "A"
+    if val >= 55: return "B"
+    if val >= 40: return "C"
+    if val >= 25: return "D"
+    return "E"
+
+def condition_label(energy: int, health: int, happiness: int) -> Tuple[str, str]:
+    """MF2風のモンスター体調・コンディション (ラベル, カラーキー)"""
+    if energy < 15 or health < 25:
+        return ("COLLAPSE WARNING!", "DANGER")
+    if energy < 35:
+        return ("EXHAUSTED", "WARN")
+    if energy >= 70 and happiness >= 75:
+        return ("PEAK FORM !!", "PEAK")
+    if energy >= 50 and happiness >= 50:
+        return ("GREAT", "GOOD")
+    return ("NORMAL", "NORMAL")
 
 def zone_of(gear_id: int) -> int:
     """部位ゾーン: 0=HEAD, 1=BACK, 2=BELLY, 3=AURA"""
