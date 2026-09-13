@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""jpg2ink.py — JPG/PNG → E-Ink用1bit Cヘッダ変換 (GxEPD2 drawXBitmap互換XBM + RLE)。
+
+使い方:
+  python tools/jpg2ink.py input.jpg --name hero --size 96 -o src/display/art_hero.h
+  python tools/jpg2ink.py input.jpg --preview-only   # 変換プレビューのみ
+
+最適化: autocontrast → dither(既定atkinson) → XBM配列 + RLE配列を併記。
+RLEは struct {uint16_t count; uint8_t bit;} のbit-run形式。
+"""
+import argparse
+import os
+import sys
+
+from PIL import Image, ImageEnhance, ImageOps
+
+
+def atkinson(img):
+    """Atkinsonディザ (e-ink向け・ノイズ少なめ)。L モード入力→1bit Image返却。"""
+    px = img.load()
+    w, h = img.size
+    buf = [[float(px[x, y]) for x in range(w)] for y in range(h)]
+    out = Image.new("1", (w, h))
+    op = out.load()
+    for y in range(h):
+        for x in range(w):
+            old = buf[y][x]
+            new = 255.0 if old > 128 else 0.0
+            op[x, y] = 255 if new > 0 else 0
+            err = (old - new) / 8.0
+            for dx, dy in ((1, 0), (2, 0), (-1, 1), (0, 1), (1, 1), (0, 2)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < w and 0 <= ny < h:
+                    buf[ny][nx] += err
+    return out
+
+
+def ordered_bayer(img, n=4):
+    m4 = (
+        (0, 8, 2, 10),
+        (12, 4, 14, 6),
+        (3, 11, 1, 9),
+        (15, 7, 13, 5),
+    )
+    px = img.load()
+    w, h = img.size
+    out = Image.new("1", (w, h))
+    op = out.load()
+    for y in range(h):
+        for x in range(w):
+            t = (m4[y % 4][x % 4] + 0.5) * 16 - 8
+            op[x, y] = 255 if px[x, y] > 128 + t else 0
+    return out
+
+
+def to_bitmap(img1):
+    """1bit Image → XBM順 (LSB first, row-major) bytes。"""
+    w, h = img1.size
+    px = img1.load()
+    data = bytearray()
+    for y in range(h):
+        byte = 0
+        bits = 0
+        for x in range(w):
+            if px[x, y] == 0:  # 黒=1
+                byte |= 1 << bits
+            bits += 1
+            if bits == 8:
+                data.append(byte)
+                byte = 0
+                bits = 0
+        if bits:
+            data.append(byte)
+    return bytes(data)
+
+
+def rle_encode_bits(img1):
+    """bit-run RLE: [(count:0-65535, bit:0/1)]。"""
+    w, h = img1.size
+    px = img1.load()
+    runs = []
+    cur = 1 if px[0, 0] == 0 else 0
+    cnt = 0
+    for y in range(h):
+        for x in range(w):
+            b = 1 if px[x, y] == 0 else 0
+            if b == cur and cnt < 65535:
+                cnt += 1
+            else:
+                runs.append((cnt, cur))
+                cur = b
+                cnt = 1
+    runs.append((cnt, cur))
+    return runs
+
+
+def ascii_preview(img1, maxw=72):
+    w, h = img1.size
+    sx = max(1, w // maxw)
+    px = img1.load()
+    lines = []
+    for y in range(0, h, sx * 2):
+        row = ""
+        for x in range(0, w, sx):
+            row += "##" if px[x, y] == 0 else "  "
+        lines.append(row)
+    return "\n".join(lines)
+
+
+def convert_image(input_path, name=None, output_path=None, size=96,
+                  dither="atkinson", threshold=128, contrast=1.3,
+                  invert=False, no_auto_bg=False, preview_only=False):
+    if name is None:
+        base = os.path.splitext(os.path.basename(input_path))[0]
+        name = base
+    if output_path is None and not preview_only:
+        output_path = os.path.join("src", "display", f"art_{name}.h")
+
+    img = Image.open(input_path).convert("RGB")
+    img = ImageOps.autocontrast(img, cutoff=1)
+    if contrast != 1.0:
+        img = ImageEnhance.Contrast(img).enhance(contrast)
+    # 正方形に中央切り抜き→リサイズ
+    side = min(img.size)
+    l = (img.size[0] - side) // 2
+    t = (img.size[1] - side) // 2
+    img = img.crop((l, t, l + side, t + side)).resize((size, size), Image.LANCZOS)
+    gray = img.convert("L")
+    # 背景自動白化: 四隅平均が暗ければ被写体が暗背景とみなし反転
+    auto_inv = False
+    if not no_auto_bg and not invert:
+        w0, h0 = gray.size
+        px0 = gray.load()
+        corners = [px0[0, 0], px0[w0 - 1, 0], px0[0, h0 - 1], px0[w0 - 1, h0 - 1]]
+        auto_inv = sum(corners) / 4 < 128
+    if dither == "atkinson":
+        bw = atkinson(gray)
+    elif dither == "floyd":
+        bw = gray.convert("1")
+    elif dither == "bayer":
+        bw = ordered_bayer(gray)
+    else:
+        bw = gray.point(lambda v: 255 if v > threshold else 0, mode="1")
+    if invert or auto_inv:
+        bw = ImageOps.invert(bw.convert("L")).convert("1")
+
+    print(ascii_preview(bw))
+    raw = to_bitmap(bw)
+    runs = rle_encode_bits(bw)
+    rle_bytes = len(runs) * 3
+    print(f"[{name}] size={size}x{size} raw={len(raw)}B rle={rle_bytes}B "
+          f"({100 * rle_bytes // max(1, len(raw))}%) dither={dither}"
+          f"{' auto-bg-inv' if auto_inv else ''}")
+    print("推奨: " + ("RLE" if rle_bytes < len(raw) else "XBM生配列")
+          + " (小さい方を使い、描画はdrawXBitmap/RLE展開)")
+    if preview_only or not output_path:
+        return
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write(f"#pragma once\n// auto-generated by tools/jpg2ink.py from {os.path.basename(input_path)}\n")
+        f.write(f"// {size}x{size} XBM + bit-run RLE. 黒=描画。\n\n")
+        f.write(f"#define {name.upper()}_W {size}\n#define {name.upper()}_H {size}\n\n")
+        f.write(f"static const unsigned char {name}_xbm[{len(raw)}] PROGMEM = {{\n")
+        for i in range(0, len(raw), 12):
+            f.write("  " + ", ".join(f"0x{b:02x}" for b in raw[i:i + 12]) + ",\n")
+        f.write("};\n\n")
+        f.write("#ifndef INK_RLE_DEFINED\n#define INK_RLE_DEFINED\n")
+        f.write("struct InkRLE { uint16_t count; uint8_t bit; };\n#endif\n")
+        f.write(f"static const InkRLE {name}_rle[{len(runs)}] PROGMEM = {{\n")
+        for i in range(0, len(runs), 8):
+            f.write("  " + ", ".join(f"{{{c},{b}}}" for c, b in runs[i:i + 8]) + ",\n")
+        f.write("};\n")
+    # 目視用プレビューPNGも併存
+    bw.resize((size * 3, size * 3), Image.NEAREST).convert("RGB").save(
+        os.path.splitext(output_path)[0] + "_preview.png")
+    print(f"wrote {output_path}")
+
+
+def main():
+    import glob
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input", nargs="?", default=None, help="入力画像ファイル")
+    ap.add_argument("--morphs", action="store_true",
+                    help="assets/ink_m*_idle.jpg を自動走査して形態ヘッダーを一括生成")
+    ap.add_argument("--name", default=None)
+    ap.add_argument("-o", "--output", default=None)
+    ap.add_argument("--size", type=int, default=96)
+    ap.add_argument("--dither", choices=["atkinson", "floyd", "bayer", "threshold"],
+                    default="atkinson")
+    ap.add_argument("--threshold", type=int, default=128)
+    ap.add_argument("--contrast", type=float, default=1.3)
+    ap.add_argument("--invert", action="store_true")
+    ap.add_argument("--no-auto-bg", action="store_true",
+                    help="背景自動白化を無効化 (四隅が暗いと反転する)")
+    ap.add_argument("--preview-only", action="store_true")
+    a = ap.parse_args()
+
+    if a.morphs:
+        files = sorted(glob.glob(os.path.join("assets", "ink_m*_idle.jpg")))
+        if not files:
+            print("形態画像が見つかりません: assets/ink_m*_idle.jpg")
+            return
+        for fpath in files:
+            base = os.path.splitext(os.path.basename(fpath))[0]
+            out = os.path.join("src", "display", f"art_{base}.h")
+            convert_image(fpath, name=base, output_path=out, size=a.size,
+                          dither=a.dither, threshold=a.threshold,
+                          contrast=a.contrast, invert=a.invert,
+                          no_auto_bg=a.no_auto_bg, preview_only=a.preview_only)
+        return
+
+    if not a.input:
+        ap.print_help()
+        return
+
+    name = a.name or os.path.splitext(os.path.basename(a.input))[0]
+    convert_image(a.input, name=name, output_path=a.output, size=a.size,
+                  dither=a.dither, threshold=a.threshold,
+                  contrast=a.contrast, invert=a.invert,
+                  no_auto_bg=a.no_auto_bg, preview_only=a.preview_only)
+
+
+if __name__ == "__main__":
+    main()

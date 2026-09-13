@@ -1,0 +1,10 @@
+[project]
+name = "inklife-companion"
+version = "2.0.0"
+description = "InkLife 3D Cyber-Voxel Companion Station"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "raylib>=6.0.0",
+    "pyserial>=3.5",
+]

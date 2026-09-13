@@ -1,0 +1,972 @@
+// Ink Life — E-Ink LoRa人工生命 (Milestone 9: 現象エンジン＋電波エントロピー遺伝＋デュアルコア)
+// FQBN: esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB
+#include <Arduino.h>
+#include "src/hardware/hal.h"
+#include "src/life/creature.h"
+#include "src/behavior/ai.h"
+#include "src/ui/actions.h"
+#include "src/time/clock.h"
+#include "src/power/sleep.h"
+#include "src/storage/store.h"
+#include "src/radio/mesh.h"
+#include "src/genetics/breeding.h"
+#include "src/core/jobs.h"
+#include "src/display/screen.h"
+
+namespace {
+// deep sleepをまたぐ状態。電源断で消える (NVSが保険)。
+RTC_DATA_ATTR uint32_t rtcMagic = 0;
+RTC_DATA_ATTR Creature rtcCre;
+RTC_DATA_ATTR uint64_t rtcLastUs = 0;
+RTC_DATA_ATTR uint32_t rtcBoots = 0;
+RTC_DATA_ATTR char rtcEvent[32] = {0};
+RTC_DATA_ATTR uint32_t rtcUnix = 0;  // 最後にTIMEで知ったunix秒 (不在計算用)
+RTC_DATA_ATTR uint8_t rtcPendingEvt = 0;  // 未送EVENT符号 (誕生時に1。次無線で送出)
+RTC_DATA_ATTR field::State rtcField;      // 現象盤 (576B)
+RTC_DATA_ATTR bool rtcFieldInit = false;  // 盤面初期化済み
+RTC_DATA_ATTR bool rtcAllowBle = true;    // BLEスキャン許可 (NVSキルスイッチ連動)
+// 知人帳 (M6): 聞いた他個体を最大6件記憶。電源断で忘れる (引っ越し扱い)。
+// cyd式パッキング: rssiはdBm整数、countは255飽和。20B/件。
+struct PeerInfo {
+  uint32_t did;
+  uint32_t lastAge;  // 最終目撃時の自年齢
+  uint16_t species;
+  uint8_t gen;
+  int8_t rssi;       // dBm整数 (-120〜0)
+  uint8_t count;     // 累計受信回数 (255飽和)
+  uint8_t ti, cu, ag, so;  // 形質 (v2 STATUS受信時のみ有効)
+  bool hasTr;
+  bool hasSpecies;  // HELLOで種既知か (STATUSのみ知人はfalse)
+  int8_t aff;       // 好感度-100〜+100。tickで0へ減衰、停電で忘れる (M10)
+};
+static_assert(sizeof(PeerInfo) == 20, "PeerInfo must be 20B (20B payload, no pad)");
+RTC_DATA_ATTR PeerInfo rtcPeers[6];
+RTC_DATA_ATTR uint8_t rtcPeerN = 0;
+static const bool SLEEP_ENABLE = false;  // 通常はOFF (常時起動)。電池運用でtrueに。
+static const uint32_t RTC_MAGIC = 0x494E4B51;  // "INKQ" (aff追加で更新。旧RTC破棄→NVS復元)
+static const uint32_t TICK_SEC = 30;
+static const uint32_t CATCHUP_MAX_STEPS = 24;  // 不在12時間分で打ち止め
+bool gDispOk = false;
+bool gStayAwake = false;  // trueでsleepせず常時起動 (開発・PC接続用)
+unsigned long gStayTick = 0;
+static unsigned long gLastDrawMs = 0;  // 最終描画時刻 (tick重複抑制用)
+uint32_t gDrawCount = 0;   // 描画回数 (PX監査用。再起動で0)
+uint32_t gStallCount = 0;  // 3秒超え描画の回数 (パネル失速検出。GxEPD2はtimeout突破する)
+uint8_t gPendBtn = 0;  // 受信窓中の押下保持 (取りこぼし防止)
+void stayDraw(bool full);  // 後方定義 (loop中の描画は時刻を刻む)
+
+void logLife() {
+  Serial.print("+LIFE age=");
+  Serial.print(rtcCre.age_sec);
+  Serial.print(" hp=");
+  Serial.print(rtcCre.health);
+  Serial.print(" hu=");
+  Serial.print(rtcCre.hunger);
+  Serial.print(" en=");
+  Serial.print(rtcCre.energy);
+  Serial.print(" ha=");
+  Serial.print(rtcCre.happiness);
+  Serial.print(" act=");
+  Serial.print(actionName(rtcCre.action));
+  Serial.print(" gen=");
+  Serial.print(rtcCre.generation);
+  Serial.print(" tr=");
+  Serial.print(rtcCre.intelligence);
+  Serial.print(",");
+  Serial.print(rtcCre.curiosity);
+  Serial.print(",");
+  Serial.print(rtcCre.aggression);
+  Serial.print(",");
+  Serial.println(rtcCre.sociability);
+}
+
+// 配偶子探索: 好感度最大の形質既知知人 (同点は最新)。居なければnullptr (自家系)。
+// 好きな相手と繁殖する (M10)。嫌いでも拒否はしない (種の存続優先)。
+void setEvent(const char* e);  // 後方定義
+const genetics::Genes* findMateGenes() {
+  static genetics::Genes g;
+  int best = -1;
+  for (uint8_t i = 0; i < rtcPeerN; i++) {
+    if (!rtcPeers[i].hasTr) continue;
+    if (best < 0 || rtcPeers[i].aff > rtcPeers[best].aff ||
+        (rtcPeers[i].aff == rtcPeers[best].aff && rtcPeers[i].lastAge > rtcPeers[best].lastAge))
+      best = i;
+  }
+  if (best < 0) return nullptr;
+  g.intelligence = rtcPeers[best].ti;
+  g.curiosity = rtcPeers[best].cu;
+  g.aggression = rtcPeers[best].ag;
+  g.sociability = rtcPeers[best].so;
+  // STATUSのみ知人は種未知。ones-digit偏り防止に自種で代用 (見た目系統のみに影響)
+  g.species = rtcPeers[best].hasSpecies ? rtcPeers[best].species : rtcCre.species_id;
+  for (int i = 0; i < 4; i++) g.fuse[i] = 255;  // 電文にfuseは無い。相手主形態はbreed側でmorphOfする
+  return &g;
+}
+
+static uint32_t espRng() { return esp_random(); }
+
+// 電波エントロピーでseedしたRNG (繁殖専用)。通常時はesp_random直結。
+static uint32_t gSeed = 0x9E3779B9UL;
+static uint32_t inkRand() {
+  gSeed ^= gSeed << 13; gSeed ^= gSeed >> 17; gSeed ^= gSeed << 5;
+  return gSeed;
+}
+
+// 世代交代。mate==nullptrで自家系＋変異。誕生EVENTを次無線で放送。
+// 繁殖前にcore0で電波サーベイし、そのseedでRNGを初期化する (環境が遺伝に触る)。
+void doRebirth(const genetics::Genes* mate) {
+  // sv/saはstatic: jobs::runがタイムアウトで復帰してもcore0が触り続ける。
+  // doRebirthは単発逐次呼び出し限定のため安全。FieldArg側はRTC常駐で元々安全。
+  static radio::Survey sv;
+  static jobs::SurveyArg sa{&sv, false};
+  sa.allowBle = rtcAllowBle;
+  if (jobs::run(jobs::SURVEY, &sa, 20000) && sv.seed) {
+    gSeed = sv.seed;
+    Serial.print("+RADIO wifi=");
+    Serial.print(sv.wifiN);
+    Serial.print("/");
+    Serial.print(sv.wifiMax);
+    Serial.print(" ble=");
+    Serial.print(sv.bleN);
+    Serial.print("/");
+    Serial.print(sv.bleMax);
+    Serial.print(sv.bleOk ? " ok seed=" : " ng seed=");
+    Serial.println(gSeed, HEX);
+  } else {
+    gSeed = esp_random();
+    Serial.println("+RADIO fallback esp_random");
+  }
+  genetics::Genes A{rtcCre.intelligence, rtcCre.curiosity,
+                    rtcCre.aggression, rtcCre.sociability, rtcCre.species_id,
+                    {rtcCre.fuse[0], rtcCre.fuse[1], rtcCre.fuse[2], rtcCre.fuse[3]}};
+  genetics::Genes B = mate ? *mate : A;
+  genetics::Genes C = genetics::breed(A, B, inkRand);
+  // 環境圧: 現象盤の対称性・活動量でspeciesを微調整 (見た目に環境が出る)
+  {
+    uint8_t sym = field::symmetry(rtcField);
+    uint16_t act = field::activity(rtcField);
+    int bias = (int)(sym * 3 / 101) * 7 + (act > 200 ? 2 : act > 80 ? 1 : 0) * 3 - 10;
+    int nsp = (int)C.species + bias;
+    nsp %= 1000;
+    if (nsp < 0) nsp += 1000;
+    C.species = (uint16_t)nsp;
+    Serial.print("+FIELD sym=");
+    Serial.print(sym);
+    Serial.print(" act=");
+    Serial.print(act);
+    Serial.print(" bias=");
+    Serial.println(bias);
+  }
+  uint8_t ng = rtcCre.generation < 255 ? rtcCre.generation + 1 : 255;
+  uint32_t did = rtcCre.device_id;
+  char nm[16];
+  strncpy(nm, rtcCre.name, sizeof(nm));
+  rtcCre.health = 90; rtcCre.hunger = 20; rtcCre.energy = 90;
+  rtcCre.happiness = 70; rtcCre.cleanliness = 80;
+  rtcCre.intelligence = C.intelligence; rtcCre.curiosity = C.curiosity;
+  rtcCre.aggression = C.aggression; rtcCre.sociability = C.sociability;
+  rtcCre.species_id = C.species;
+  rtcCre.generation = ng;
+  for (int i = 0; i < 4; i++) rtcCre.fuse[i] = C.fuse[i];
+  for (int i = 0; i < 3; i++) rtcCre.habit[i] = 0;  // 生まれたては万物が新鮮 (M10)
+  rtcCre.device_id = did;
+  strncpy(rtcCre.name, nm, sizeof(rtcCre.name));
+  rtcCre.age_sec = 0;
+  // 新世代では年齢がリセットされるため、知人帳のlastAgeもリセットしないとLRU置換が逆転する
+  for (uint8_t i = 0; i < rtcPeerN; i++) rtcPeers[i].lastAge = 0;
+  rtcCre.action = Action::IDLE;
+  rtcCre.sleeping = false;
+  rtcPendingEvt = 1;
+  setEvent("BIRTH_OK");
+  Serial.print("+BORN gen=");
+  Serial.print(ng);
+  Serial.print(" mate=");
+  Serial.print(mate ? "peer" : "self");
+  Serial.print(" tr=");
+  Serial.print(C.intelligence); Serial.print(",");
+  Serial.print(C.curiosity); Serial.print(",");
+  Serial.print(C.aggression); Serial.print(",");
+  Serial.print(C.sociability); Serial.print(" sp=");
+  Serial.print(C.species); Serial.print(" fz=");
+  Serial.print(C.fuse[0]); Serial.print(",");
+  Serial.print(C.fuse[1]); Serial.print(",");
+  Serial.print(C.fuse[2]); Serial.print(",");
+  Serial.println(C.fuse[3]);
+  store::save(rtcCre, rtcEvent, clk::rtcUs(), rtcUnix, rtcPendingEvt);
+}
+
+void setEvent(const char* e) {
+  strncpy(rtcEvent, e, sizeof(rtcEvent) - 1);
+  rtcEvent[sizeof(rtcEvent) - 1] = 0;
+  screen::pushLog(e, rtcCre.age_sec);
+  Serial.print("+EVT ");
+  Serial.println(rtcEvent);
+}
+
+// 常時起動中の描画はここ経由で時刻を刻む (tickの重複再描画を抑える)。
+// ついでに転送時間を計測し、3秒超えはstall計上＋報告 (パネル失速の検出)。
+void stayDraw(bool full) {
+  unsigned long t0 = micros();
+  if (gDispOk) screen::draw(rtcCre, rtcEvent, full, rtcPeerN, &rtcField);
+  unsigned long dt = micros() - t0;
+  gDrawCount++;
+  if (gDispOk && dt > 3000000UL) {
+    gStallCount++;
+    Serial.print("+STALL dt=");
+    Serial.println(dt);
+  }
+  gLastDrawMs = millis();
+}
+
+// 描画内容hash (PX監査用)。vitals＋年齢＋行動＋イベント＋現象＋知人数。
+// hashが変わったのに画面が変わらない→パネル転送側。hash不変→内容同一描画。
+static uint32_t stateHash() {
+  uint32_t h = 2166136261UL;
+  auto mix = [&](uint32_t v) { h = (h ^ v) * 16777619UL; };
+  mix(rtcCre.health); mix(rtcCre.hunger); mix(rtcCre.energy); mix(rtcCre.happiness);
+  mix(rtcCre.cleanliness); mix(rtcCre.age_sec); mix((uint32_t)rtcCre.action);
+  for (const char* p = rtcEvent; *p; p++) mix((uint32_t)(uint8_t)*p);
+  mix(field::hash(rtcField)); mix(rtcPeerN);
+  return h;
+}
+
+// 知人帳に記録。戻り値true=新規 (満杯時は最古を置換)。
+bool learnPeer(const mesh::Peer& p) {
+  if (p.did == rtcCre.device_id) return false;  // 自機パケットは登録しない
+  for (uint8_t i = 0; i < rtcPeerN; i++) {
+    if (rtcPeers[i].did == p.did) {
+      rtcPeers[i].rssi = (int8_t)p.rssi;
+      rtcPeers[i].lastAge = rtcCre.age_sec;
+      if (rtcPeers[i].count < 255) rtcPeers[i].count++;
+      if (p.type == mesh::T_HELLO) {  // 名刺更新 (転生後の形態変わり対応)
+        rtcPeers[i].species = p.species;
+        rtcPeers[i].gen = p.gen;
+        rtcPeers[i].hasSpecies = true;
+      }
+      if (p.hasTr) {
+        rtcPeers[i].ti = p.ti; rtcPeers[i].cu = p.cu;
+        rtcPeers[i].ag = p.ag; rtcPeers[i].so = p.so;
+        rtcPeers[i].hasTr = true;
+      }
+      return false;
+    }
+  }
+  PeerInfo np{p.did, rtcCre.age_sec, p.species, p.gen, (int8_t)p.rssi, 1,
+              p.ti, p.cu, p.ag, p.so, p.hasTr, p.type == mesh::T_HELLO, 0};
+  if (rtcPeerN < 6) {
+    rtcPeers[rtcPeerN++] = np;
+  } else {
+    uint8_t old = 0;
+    for (uint8_t i = 1; i < 6; i++)
+      if (rtcPeers[i].lastAge < rtcPeers[old].lastAge) old = i;
+    rtcPeers[old] = np;
+  }
+  Serial.print("+PEERS n=");
+  Serial.println(rtcPeerN);
+  return true;
+}
+
+// 知人の好感度参照。未登録は0 (初対面は無関心)。
+static int8_t peerAff(uint32_t did) {
+  for (uint8_t i = 0; i < rtcPeerN; i++)
+    if (rtcPeers[i].did == did) return rtcPeers[i].aff;
+  return 0;
+}
+// 好感度加算 (±100飽和)。±50 crossingでBONDED/RIVAL。未登録なら何もしない。
+void addAff(uint32_t did, int d) {
+  for (uint8_t i = 0; i < rtcPeerN; i++) {
+    if (rtcPeers[i].did != did) continue;
+    int before = rtcPeers[i].aff;
+    int after = before + d;
+    if (after > 100) after = 100;
+    if (after < -100) after = -100;
+    rtcPeers[i].aff = (int8_t)after;
+    if (before < 50 && after >= 50) setEvent("BONDED");
+    else if (before > -50 && after <= -50) setEvent("RIVAL");
+    return;
+  }
+}
+// 飽き加算 (100飽和)。刺激の種類は habit[0]=FOOD 1=PLAY 2=SOCIAL。
+static void bumpHabit(uint8_t idx, uint8_t d) {
+  rtcCre.habit[idx] = rtcCre.habit[idx] > 100 - d ? 100 : rtcCre.habit[idx] + d;
+}
+// 好感度の自然減衰 (tick毎に0へ1)。6件走査の激安。長い不在は関係を冷ます。
+void decayAff() {
+  for (uint8_t i = 0; i < rtcPeerN; i++) {
+    if (rtcPeers[i].aff > 0) rtcPeers[i].aff--;
+    else if (rtcPeers[i].aff < 0) rtcPeers[i].aff++;
+  }
+}
+// 既知かつ種既知の知人の系統を引く。STATUSのみ知人・未知はfalse (系統判定不能)。
+// GREETING/FIGHTパケット自体にspeciesが無いため必須 (無ければ常にfamily 0扱いになる)。
+static bool peerFamily(uint32_t did, uint8_t& fam) {
+  for (uint8_t i = 0; i < rtcPeerN; i++)
+    if (rtcPeers[i].did == did) {
+      if (!rtcPeers[i].hasSpecies) return false;
+      fam = genetics::familyOf(rtcPeers[i].species);
+      return true;
+    }
+  return false;
+}
+
+// 受信リアクション (M7)。自動返信はしない (GREETING往復ループ防止)。
+// 効果は自個体内の変化＋イベント表示のみ。
+void reactPeer(const mesh::Peer& p) {
+  if (p.did == rtcCre.device_id) return;  // 自機パケットには反応しない
+  switch (p.type) {
+    case mesh::T_GREETING: {
+      // 効き = (同族5/他族3/未知4 ＋ 好感度/25) × 社交飽き。仲良しほど嬉しい。
+      uint8_t pf = 0;
+      bool known = peerFamily(p.did, pf);
+      int8_t fa = peerAff(p.did);
+      int tot;
+      const char* ev;
+      int affD;
+      if (known && pf == genetics::familyOf(rtcCre.species_id)) {
+        tot = 5 + fa / 25; ev = "ALLY_RX"; affD = 6;
+      } else if (known) {
+        tot = 3 + fa / 25; ev = "GREET_RX"; affD = 4;
+      } else {
+        tot = 4; ev = "STRANGER_RX"; affD = 2;  // 種未知のよそ者。好奇心だけ刺激
+      }
+      tot = habGain(tot, rtcCre.habit[2]);
+      if (tot < 0) tot = 0;
+      if (tot > 10) tot = 10;
+      rtcCre.happiness = min(100, (int)rtcCre.happiness + tot);
+      setEvent(ev);
+      addAff(p.did, affD);
+      bumpHabit(2, 20);
+      break;
+    }
+    case mesh::T_FOOD:
+      rtcCre.hunger = rtcCre.hunger > p.x1 ? rtcCre.hunger - p.x1 : 0;  // 栄養は飽きない
+      rtcCre.happiness = min(100, (int)rtcCre.happiness + habGain(5, rtcCre.habit[0]));
+      setEvent("FOOD_RX");
+      addAff(p.did, 6);
+      bumpHabit(0, 25);
+      break;
+    case mesh::T_PLAY:
+      if (rtcCre.energy >= 20) {
+        rtcCre.happiness = min(100, (int)rtcCre.happiness + habGain(8, rtcCre.habit[1]));
+        rtcCre.energy -= 5;
+        setEvent("PLAY_RX");
+        addAff(p.did, 8);
+        bumpHabit(1, 25);
+      } else {
+        setEvent("FATIGUE");
+      }
+      break;
+    case mesh::T_FIGHT: {
+      // 勝敗 = aggression＋乱数＋系統相性。荒事は命懸け。種未知の相手には相性なし (五分)。
+      // 親友 (aff≥30) とは手加減試合: 痛み半減。いじめ (勝利) は好感度を失う。
+      uint32_t mine = rtcCre.aggression + esp_random() % 30;
+      uint32_t theirs = p.x1 + esp_random() % 30;
+      uint8_t pf = 0;
+      if (peerFamily(p.did, pf) &&
+          genetics::familyBeats(genetics::familyOf(rtcCre.species_id), pf)) mine += 15;
+      int8_t fa = peerAff(p.did);
+      if (mine >= theirs) {
+        rtcCre.happiness = min(100, (int)rtcCre.happiness + 10);
+        setEvent("COMBAT_WIN");
+        addAff(p.did, -5);
+      } else {
+        int dmg = (fa >= 30 && rtcCre.health > 2) ? 2 : 5;
+        if (rtcCre.health > dmg) rtcCre.health -= dmg;
+        setEvent("COMBAT_LOSS");
+        addAff(p.did, -10);
+      }
+      break;
+    }
+    case mesh::T_TRADE:
+      // 交換提案 (give=X)。空腹なら受諾。親友 (aff>40) には少し空腹でも分ける。
+      if (rtcCre.hunger > 40 || (peerAff(p.did) > 40 && rtcCre.hunger > 20)) {
+        rtcCre.hunger = rtcCre.hunger > p.x1 ? rtcCre.hunger - p.x1 : 0;
+        rtcCre.happiness = min(100, (int)rtcCre.happiness + habGain(5, rtcCre.habit[0]));
+        setEvent("TRADE_OK");
+        addAff(p.did, 6);
+        bumpHabit(0, 25);
+      } else {
+        setEvent("TRADE_REFUSE");
+        addAff(p.did, -2);
+      }
+      break;
+    case mesh::T_EVENT:
+      if (p.x1 == 1) {
+        setEvent("BIRTH_RX"); rtcCre.happiness = min(100, (int)rtcCre.happiness + 5);
+        addAff(p.did, 4);  // 誕生の祝いは絆になる
+      }
+      else if (p.x1 == 3) {
+        setEvent("GETWELL_RX"); rtcCre.happiness = min(100, (int)rtcCre.happiness + 3);
+        addAff(p.did, 2);
+      }
+      else if (p.x1 == 4) { setEvent("SLEEP_RX"); addAff(p.did, 1); }
+      break;
+    default:
+      break;  // HELLO/STATUSは知人帳のみ
+  }
+}
+
+static const char* typeName(uint8_t t) {
+  switch (t) {
+    case mesh::T_HELLO: return "HELLO";
+    case mesh::T_STATUS: return "STATUS";
+    case mesh::T_GREETING: return "GREETING";
+    case mesh::T_FOOD: return "FOOD";
+    case mesh::T_PLAY: return "PLAY";
+    case mesh::T_FIGHT: return "FIGHT";
+    case mesh::T_TRADE: return "TRADE";
+    case mesh::T_EVENT: return "EVENT";
+  }
+  return "?";
+}
+
+// 無線 cycle (HELLO+STATUS送信→行動パケット→誕生EVENT→2秒受信窓→sleep)。
+void doRadioCycle() {
+  SPI.begin(HAL_LORA_SCK, HAL_LORA_MISO, HAL_LORA_MOSI, HAL_LORA_NSS);
+  if (!mesh::begin()) {
+    Serial.println("+HELLO ng");
+    return;
+  }
+  led::blip();  // 無線活動中は点灯 (tick停止中も光り続ける)
+  Serial.println(mesh::sendHello(rtcCre) ? "+HELLO ok" : "+HELLO fail");
+  Serial.println(mesh::sendStatus(rtcCre) ? "+STATUS tx ok" : "+STATUS tx fail");
+  // 行動連動の1発 (M7)。COMM=挨拶、PLAY=誘い、FIGHT=挑戦、飢餓=物乞い。
+  if (rtcCre.action == Action::COMM)
+    Serial.println(mesh::sendGreeting(rtcCre) ? "+GREETING ok" : "+GREETING fail");
+  else if (rtcCre.action == Action::PLAY && rtcPeerN > 0)
+    Serial.println(mesh::sendPlay(rtcCre) ? "+PLAY tx ok" : "+PLAY tx fail");
+  else if (rtcCre.action == Action::FIGHT)
+    Serial.println(mesh::sendFight(rtcCre) ? "+FIGHT tx ok" : "+FIGHT tx fail");
+  else if (rtcCre.hunger > 80 && rtcPeerN > 0)
+    Serial.println(mesh::sendTrade(rtcCre, 0, 20) ? "+TRADE beg ok" : "+TRADE beg fail");
+  if (rtcPendingEvt) {
+    Serial.println(mesh::sendEvent(rtcCre, rtcPendingEvt) ? "+EVENT tx ok" : "+EVENT tx fail");
+    rtcPendingEvt = 0;
+  }
+  mesh::Peer p;
+  uint8_t radioBtn = 0;
+  if (mesh::recvWindow(p, 2000, &radioBtn)) {
+    if (p.did != rtcCre.device_id) {
+      Serial.print("+HEARD did=");
+      Serial.print(p.did, HEX);
+      Serial.print(" type=");
+      Serial.print(typeName(p.type));
+      Serial.print(" rssi=");
+      Serial.println(p.rssi, 1);
+      bool isNew = learnPeer(p);
+      reactPeer(p);
+      if (isNew) setEvent("PEER_FOUND");
+    } else {
+      Serial.println("+HEARD self ignored");
+    }
+  } else if (radioBtn) {
+    gPendBtn |= radioBtn;  // 受信窓中の押下はloop先頭で処理 (取りこぼし防止)
+    Serial.println("+HEARD abort");
+  } else {
+    Serial.println("+HEARD none");
+  }
+  mesh::sleep();
+}
+
+// "TIME 1234567890" 行だけ拾う (起動窓用)。戻り値はunix秒、無ければ0。
+// "STAY" 行で常時起動モードに入る (deep sleep回避)。
+uint32_t pollTime(uint32_t window_ms) {
+  static char buf[65];  // cyd式: 行バッファは固定配列。Stringのheap確保をしない
+  static uint8_t blen = 0;
+  static bool bOverflow = false;
+  buf[blen] = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < window_ms) {
+    while (Serial.available()) {
+      char c = (char)Serial.read();
+      if (c == '\n') {
+        uint32_t ret = 0;
+        if (!bOverflow) {
+          // 前後空白を飛ばして判定 (旧String::trim相当)
+          char* p = buf;
+          while (*p == ' ' || *p == '\t') p++;
+          char* e = p + strlen(p);
+          while (e > p && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+          if (strncmp(p, "TIME ", 5) == 0) {
+            long u = atol(p + 5);
+            if (u > 1000000000L) ret = (uint32_t)u;
+          } else if (strcmp(p, "STAY") == 0) {
+            gStayAwake = true;
+            Serial.println("+STAY nosleep");
+          }
+        }
+        blen = 0; buf[0] = 0; bOverflow = false;
+        if (ret) return ret;
+      } else if (c != '\r') {
+        if (!bOverflow) {
+          if (blen < 64) { buf[blen++] = c; buf[blen] = 0; }
+          else { bOverflow = true; blen = 0; buf[0] = 0; }
+        }
+      }
+    }
+    uint8_t b = halButtons();
+    if (b && millis() > 8000) {  // 起動直後のUSB列挙ノイズ (BOOT誤爆) を無視。boot-hold判定は別路のため無影響
+      led::blip();
+      setEvent((b & 2) ? ui::play(rtcCre) : ui::feed(rtcCre));
+    }
+    delay(50);
+  }
+  return 0;
+}
+}  // namespace
+
+void setup() {
+  Serial.setTxBufferSize(1024);  // FIELDBダンプ(420B)等のバースト出力あふれ防止
+  Serial.setRxBufferSize(512);   // PCコンパニオン接続時のコマンドバースト取りこぼし防止
+  Serial.begin(115200);
+  Serial.setTxTimeoutMs(10);     // 0はESP32 core 3.xのHWCDCでtriesアンダーフロー(42億回ループ死)バグを踏むため10msに設定
+  delay(300);
+  Serial.println("+INK start");
+  halInit();
+  jobs::init();  // core0ワーカー起動 (loopはcore1)
+  if (digitalRead(HAL_BTN_SIDE) == LOW) {
+    // SIDE押しながら起動＝常時起動モード (ケーブルレス開発用)
+    gStayAwake = true;
+    Serial.println("+STAY boot-hold");
+  }
+  if (!SLEEP_ENABLE && !gStayAwake) {
+    // M6開発中はsleep OFFが既定。実運用 (SLEEP_ENABLE=true) で周回する。
+    gStayAwake = true;
+    Serial.println("+SLEEP off (stay default)");
+  }
+
+  bool fresh = (rtcMagic != RTC_MAGIC);
+  bool isGenesis = false;  // NVSにも居ない完全新規 (スプラッシュ用)
+  const char* src = "fresh";
+  uint32_t absence = 0;
+  // BLEキルスイッチ読込 (NVS)。無ければ許可既定。
+  {
+    Preferences bp;
+    if (bp.begin("inklife", true)) {
+      rtcAllowBle = bp.getUChar("ble", 1) != 0;
+      bp.end();
+    }
+  }
+  if (!rtcFieldInit) {
+    // 現象盤の創世。初回のみ。
+    field::randomize(rtcField, esp_random());
+    rtcFieldInit = true;
+  }
+  // 現象をcore0で4ステップ進行 (電源断復帰後の不在分は別途catch-up済みの tick 扱い)
+  {
+    jobs::FieldArg fa{&rtcField, 4};
+    if (jobs::run(jobs::FIELD, &fa, 5000)) {
+      Serial.print("+FIELD hash=");
+      Serial.print(field::hash(rtcField), HEX);
+      Serial.print(" act=");
+      Serial.print(field::activity(rtcField));
+      Serial.print(" sym=");
+      Serial.println(field::symmetry(rtcField));
+    } else {
+      Serial.println("+FIELD timeout");
+    }
+  }
+  if (fresh) {
+    rtcPeerN = 0;
+    memset(rtcPeers, 0, sizeof(rtcPeers));
+    uint64_t savedRtc = 0;
+    uint32_t savedUnix = 0;
+    char ev[32] = {0};
+    uint8_t pev = 0;
+    if (store::load(rtcCre, ev, sizeof(ev), savedRtc, savedUnix, pev)) {
+      // 電源断復帰。TIMEを待って不在時間を確定させる (最大25秒、電池時は即諦め)。
+      src = "nvs";
+      strncpy(rtcEvent, ev, sizeof(rtcEvent) - 1);
+      rtcPendingEvt = pev;  // 未送EVENT (誕生放送) を再起動越えで引継ぎ
+      Serial.println("+WAITTIME 25s (or press button to skip)");
+      unsigned long t0 = millis();
+      uint32_t unixNow = 0;
+      while (millis() - t0 < 25000 && unixNow == 0) {
+        unixNow = pollTime(500);
+        if (halButtons()) break;  // ボタンでスキップ
+      }
+      if (unixNow > 0 && savedUnix > 0 && unixNow > savedUnix) {
+        absence = unixNow - savedUnix;
+        rtcUnix = unixNow;
+        Serial.print("+ABSENCE ");
+        Serial.print(absence);
+        Serial.println("s");
+      } else {
+        setEvent("WAKE_OK");
+      }
+    } else {
+      isGenesis = true;
+      creatureInit(rtcCre);
+      strncpy(rtcEvent, "GENESIS", sizeof(rtcEvent) - 1);
+      rtcPendingEvt = 1;  // 誕生EVENTは次無線で放送
+    }
+    rtcMagic = RTC_MAGIC;
+    rtcBoots = 0;
+  } else if (power::wokeFromSleep()) {
+    src = "rtc";
+    absence = clk::sleptSec(rtcLastUs, clk::rtcUs());
+  }
+  rtcBoots++;
+  Serial.print("+RESTORED src=");
+  Serial.print(src);
+  Serial.print(" absence=");
+  Serial.print(absence);
+  Serial.print(" boots=");
+  Serial.println(rtcBoots);
+
+  // 不在分を30秒刻みで適用。関係も冷ます。昼夜を跨いだら遷移イベント。
+  bool nightBefore = creatureNight(rtcCre.age_sec);
+  uint32_t steps = absence / 30;
+  if (steps > CATCHUP_MAX_STEPS) steps = CATCHUP_MAX_STEPS;
+  for (uint32_t i = 0; i < steps; i++) { creatureTick(rtcCre, 30); decayAff(); }
+  if (creatureNight(rtcCre.age_sec) != nightBefore)
+    setEvent(creatureNight(rtcCre.age_sec) ? "NIGHTFALL" : "DAYBREAK");
+
+  Action na = ai::decide(rtcCre, rtcPeerN);
+  if (!fresh && na != rtcCre.action) {
+    rtcCre.action = na;
+    const char* ev = actionEvent(na);
+    if (ev[0]) setEvent(ev);
+  }
+  if (rtcCre.health == 0) {  // 不在中の死もここで世代交代
+    Serial.println("+DEAD");
+    doRebirth(findMateGenes());
+  }
+  if (!fresh && strcmp(power::wakeName(), "button") == 0) {
+    setEvent(ui::feed(rtcCre));
+  }
+
+  gDispOk = screen::init();
+  Serial.print("+INK disp ");
+  Serial.println(gDispOk ? "ok" : "BUSY_STUCK");
+
+  // 無線 (4周回に1回): HELLO+STATUS送信→2秒受信窓→sleep。常時受信はしない。
+  if (rtcBoots % 4 == 0) doRadioCycle();
+  if (isGenesis && gDispOk) {  // 初誕生のみスプラッシュ
+    screen::splash(rtcCre);
+    delay(2500);
+  }
+  if (gDispOk) stayDraw(fresh);
+  logLife();
+
+  // 就寝前の短窓: 通常1.5秒 (ボタン受付)
+  unsigned long w0 = millis();
+  while (millis() - w0 < 1500) {
+    if (millis() - w0 > 800) {
+      uint8_t b = halButtons();
+      if (b && gDispOk) {
+        led::blip();
+        setEvent((b & 2) ? ui::play(rtcCre) : ui::feed(rtcCre));
+        stayDraw(false);
+      }
+    }
+    delay(50);
+  }
+
+  // NVS保存は4周回に1回 (フラッシュ消耗抑制)。電源断時は最大2分ロス。
+  if (rtcBoots % 4 == 0) {
+    bool ok = store::save(rtcCre, rtcEvent, clk::rtcUs(), rtcUnix, rtcPendingEvt);
+    Serial.print("+SAVED ");
+    Serial.println(ok ? "ok" : "FAIL");
+  }
+  if (gStayAwake) {
+    Serial.println("+STAYAWAKE nosleep loop");
+    gStayTick = millis();
+    return;  // 睡眠せずloopへ (開発・PC接続用)
+  }
+  rtcLastUs = clk::rtcUs();
+  if (gDispOk) screen::hibernate();  // パネルDC-DC昇圧回路等を完全休止して漏電防止
+  power::sleepCycle(TICK_SEC);  // 戻らない
+}
+
+// FOODおすそわけ放送 (BOOT長押し用)。無線を都度起こして送って寝かせる。
+void giftFood() {
+  SPI.begin(HAL_LORA_SCK, HAL_LORA_MISO, HAL_LORA_MOSI, HAL_LORA_NSS);
+  if (!mesh::begin()) {
+    Serial.println("+FOOD ng");
+    return;
+  }
+  Serial.println(mesh::sendFood(rtcCre, 20) ? "+FOOD tx ok" : "+FOOD tx fail");
+  mesh::sleep();
+  setEvent("FOOD_TX");
+}
+
+// 16進パケット行の解析 (INJECT用)。不正なら-1。
+static int hexNybble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static int hexParse(const char* s, uint8_t* out, int maxn) {
+  int sl = strlen(s);
+  if (sl == 0 || (sl & 1) || sl / 2 > maxn) return -1;
+  for (int i = 0; i < sl; i += 2) {
+    int hi = hexNybble(s[i]), lo = hexNybble(s[i + 1]);
+    if (hi < 0 || lo < 0) return -1;
+    out[i / 2] = (uint8_t)((hi << 4) | lo);
+  }
+  return sl / 2;
+}
+
+void loop() {
+  if (!gStayAwake) return;  // 通常運用ではここに来ない
+  // 常時起動モード: 30秒tick＋ボタン＋TIME受付。USB抜去まで眠らない。
+  uint8_t b = halButtons() | gPendBtn;  // 受信窓中の押下も拾う
+  gPendBtn = 0;
+  if (b && millis() > 8000) {  // pollTime側と同一ガード (USB列挙ノイズ対策)
+    led::blip();
+    Serial.print("+BTN b=");
+    Serial.print(b);
+    Serial.print(" t=");
+    Serial.println(millis());
+    setEvent((b & 2) ? ui::play(rtcCre) : ui::feed(rtcCre));
+    stayDraw(false);
+    gStayTick = millis();
+  }
+  // BOOT長押し (1.2秒) でFOODおすそわけ
+  {
+    static unsigned long pressStart = 0;
+    static bool fired = false;
+    if (halLevel() & 1) {
+      if (pressStart == 0) {
+        pressStart = millis();
+        fired = false;
+      } else if (!fired && millis() - pressStart > 1200) {
+        fired = true;
+        giftFood();
+        stayDraw(false);
+      }
+    } else {
+      pressStart = 0;
+      fired = false;
+    }
+  }
+  // SIDE長押し (1.2秒) でトレーニング (MF2式)
+  {
+    static unsigned long sidePressStart = 0;
+    static bool sideFired = false;
+    if (halLevel() & 2) {
+      if (sidePressStart == 0) {
+        sidePressStart = millis();
+        sideFired = false;
+      } else if (!sideFired && millis() - sidePressStart > 1200) {
+        sideFired = true;
+        led::blip();
+        delay(80);
+        led::blip();
+        setEvent(ui::train(rtcCre));
+        stayDraw(false);
+        gStayTick = millis();
+      }
+    } else {
+      sidePressStart = 0;
+      sideFired = false;
+    }
+  }
+  // TIME行の受付 (PC時刻同期用)。STARVE/REBORNは開発用デバッグ。
+  // INJECT/KILL/AGE/FEED/SPLASHはシリアル疑似試験用 (対向機なしで全要素を試す)。
+  static char tbuf[65];  // cyd式: 固定配列 (String不使用)
+  static uint8_t tblen = 0;
+  static bool tbOverflow = false;
+  tbuf[tblen] = 0;
+  int rxLimit = 0;
+  while (Serial.available() && ++rxLimit < 256) {
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      if (!tbOverflow) {
+        char* p = tbuf;
+        while (*p == ' ' || *p == '\t') p++;
+        char* e = p + strlen(p);
+        while (e > p && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
+      if (strncmp(p, "TIME ", 5) == 0) {
+        long u = atol(p + 5);
+        if (u > 1000000000L) {
+          rtcUnix = (uint32_t)u;
+          Serial.println("+TIME ok");
+        }
+      } else if (strcmp(p, "STARVE") == 0) {
+        rtcCre.hunger = 100;
+        Serial.println("+STARVE ok");
+      } else if (strcmp(p, "REBORN") == 0) {
+        doRebirth(findMateGenes());
+        stayDraw(true);
+      } else if (strcmp(p, "BLE 0") == 0 || strcmp(p, "BLE 1") == 0) {
+        // BLEスキャンのキルスイッチ (開発用)。不安定時のみ切る。
+        rtcAllowBle = (p[4] == '1');
+        Preferences bp;
+        if (bp.begin("inklife", false)) {
+          bp.putUChar("ble", rtcAllowBle ? 1 : 0);
+          bp.end();
+        }
+        Serial.print("+BLE ");
+        Serial.println(rtcAllowBle ? "on" : "off");
+      } else if (strcmp(p, "BENCH") == 0) {
+        // sprite描画CPU時間計測 (e-ink転送を除く純粋描画)。HexaMIDIのbench流儀
+        unsigned long bt0 = micros();
+        for (int i = 0; i < 20; i++) screen::sprite(rtcCre, creatureMood(rtcCre), 4, 16);
+        Serial.print("+BENCH sprite20us=");
+        Serial.println((unsigned long)(micros() - bt0));
+        stayDraw(false);  // バッファ復旧＋表示確認
+      } else if (strncmp(p, "INJECT ", 7) == 0) {
+        // 疑似受信: 16進パケットをparsePacket→react/learnへ。無線路と同一判定。
+        uint8_t b[32];
+        mesh::Peer peer;
+        int n = hexParse(p + 7, b, sizeof(b));
+        if (n > 0 && mesh::parsePacket(b, n, -50.0f, 7.0f, peer)) {
+          Serial.print("+INJECT ok n=");
+          Serial.println(n);
+          if (peer.did != rtcCre.device_id) {
+            Serial.print("+HEARD did=");
+            Serial.print(peer.did, HEX);
+            Serial.print(" type=");
+            Serial.print(typeName(peer.type));
+            Serial.println(" (sim)");
+            bool isNew = learnPeer(peer);
+            reactPeer(peer);
+            if (isNew) setEvent("PEER_FOUND");
+          } else {
+            Serial.println("+HEARD self ignored");
+          }
+        } else {
+          Serial.println("+INJECT ng");
+        }
+      } else if (strcmp(p, "KILL") == 0) {
+        // 疑似死: 次tickで+DEAD→自動世代交代。regen封じに飢餓併発
+        rtcCre.health = 0;
+        rtcCre.hunger = 100;
+        Serial.println("+KILL ok");
+      } else if (strncmp(p, "AGE ", 4) == 0) {
+        long a = atol(p + 4);
+        if (a >= 0 && a <= 500000) {
+          rtcCre.age_sec = (uint32_t)a;
+          Serial.println("+AGE ok");
+        } else {
+          Serial.println("+AGE ng");
+        }
+      } else if (strcmp(p, "FEED") == 0) {
+        setEvent(ui::feed(rtcCre));
+        stayDraw(false);  // E-Ink即時反映 (PC連れ回し対応)
+        Serial.println("+FEED ok");
+      } else if (strcmp(p, "PLAY") == 0) {
+        // PC連れ回し用。SIDE短押しと同等 (energy gateあり)。
+        setEvent(ui::play(rtcCre));
+        stayDraw(false);
+        Serial.println("+PLAY ok");
+      } else if (strncmp(p, "TRAIN", 5) == 0) {
+        // MF2式トレーニング (TRAIN / TRAIN INT / TRAIN AGGR / TRAIN CURIO / TRAIN SOC)
+        int target = -1;
+        if (strstr(p, "INT")) target = 0;
+        else if (strstr(p, "AGGR")) target = 1;
+        else if (strstr(p, "CURIO")) target = 2;
+        else if (strstr(p, "SOC")) target = 3;
+        setEvent(ui::train(rtcCre, target));
+        stayDraw(false);
+        Serial.println("+TRAIN ok");
+      } else if (strcmp(p, "FZ") == 0) {
+        // 融合遺伝子照会 (PC連れ回し用)。+FZ a,b,c,d (255=空き)
+        Serial.print("+FZ ");
+        Serial.print(rtcCre.fuse[0]); Serial.print(",");
+        Serial.print(rtcCre.fuse[1]); Serial.print(",");
+        Serial.print(rtcCre.fuse[2]); Serial.print(",");
+        Serial.println(rtcCre.fuse[3]);
+      } else if (strcmp(p, "SP") == 0) {
+        // 種番号照会 (PC連れ回し用)。+SP 123
+        Serial.print("+SP ");
+        Serial.println(rtcCre.species_id);
+      } else if (strcmp(p, "AFF") == 0) {
+        // 好感度・飽きのぞき見 (M10試験用)。+AFF n / +AFF did aff / +AFF habit
+        Serial.print("+AFF n=");
+        Serial.println(rtcPeerN);
+        for (uint8_t i = 0; i < rtcPeerN; i++) {
+          Serial.print("+AFF ");
+          Serial.print(rtcPeers[i].did, HEX);
+          Serial.print(" aff=");
+          Serial.print(rtcPeers[i].aff);
+          Serial.println(rtcPeers[i].hasSpecies ? " known" : " strange");
+        }
+        Serial.print("+AFF habit=");
+        Serial.print(rtcCre.habit[0]); Serial.print(",");
+        Serial.print(rtcCre.habit[1]); Serial.print(",");
+        Serial.println(rtcCre.habit[2]);
+      } else if (strcmp(p, "PX") == 0) {
+        // 更新監査: 内容hash＋描画回数＋失速数＋最終描画からの経過ms
+        Serial.print("+PX hash=");
+        Serial.print(stateHash(), HEX);
+        Serial.print(" draws=");
+        Serial.print(gDrawCount);
+        Serial.print(" stalls=");
+        Serial.print(gStallCount);
+        Serial.print(" ago=");
+        Serial.println(millis() - gLastDrawMs);
+      } else if (strcmp(p, "FIELDB") == 0) {
+        // 現象盤ダンプ (PC連れ回し用)。12行 +FIELDB <row> <24hex> (2bit/cell packing)
+        for (uint8_t fy = 0; fy < field::H; fy++) {
+          Serial.print("+FIELDB ");
+          Serial.print(fy);
+          Serial.print(" ");
+          for (uint8_t fx = 0; fx < field::W; fx += 4) {
+            uint8_t b = 0;
+            for (uint8_t k = 0; k < 4; k++) b |= (field::get(rtcField, fx + k, fy) & 3) << (k * 2);
+            if (b < 16) Serial.print("0");
+            Serial.print(b, HEX);
+          }
+          Serial.println();
+        }
+      } else if (strcmp(p, "SPLASH") == 0) {
+          if (gDispOk) {
+            screen::splash(rtcCre);
+            delay(2500);
+            screen::draw(rtcCre, rtcEvent, true, rtcPeerN, &rtcField);
+          }
+          Serial.println("+SPLASH ok");
+        }
+      }
+      tblen = 0; tbuf[0] = 0; tbOverflow = false;
+    } else if (c != '\r') {
+      if (!tbOverflow) {
+        if (tblen < 64) { tbuf[tblen++] = c; tbuf[tblen] = 0; }
+        else { tbOverflow = true; tblen = 0; tbuf[0] = 0; }
+      }
+    }
+  }
+  if (millis() - gStayTick >= TICK_SEC * 1000UL) {
+    gStayTick = millis();
+    bool nightBefore = creatureNight(rtcCre.age_sec);
+    creatureTick(rtcCre, TICK_SEC);
+    decayAff();
+    if (creatureNight(rtcCre.age_sec) != nightBefore)
+      setEvent(creatureNight(rtcCre.age_sec) ? "NIGHTFALL" : "DAYBREAK");
+    {
+      // 現象進行はcore0 (数msのはず。詰まったら諦めて次へ)
+      jobs::FieldArg fa{&rtcField, 4};
+      jobs::run(jobs::FIELD, &fa, 5000);
+    }
+    bool reborn = false;
+    if (rtcCre.health == 0) {
+      // 寿命。知人の遺伝子があれば交配、なければ自家系で次世代へ。
+      Serial.println("+DEAD");
+      doRebirth(findMateGenes());
+      stayDraw(true);
+      reborn = true;
+    }
+    if (!reborn) {
+      Action na = ai::decide(rtcCre, rtcPeerN);
+      if (na != rtcCre.action) {
+        rtcCre.action = na;
+        const char* ev = actionEvent(na);
+        if (ev[0]) setEvent(ev);
+      }
+    }
+    logLife();
+    if (millis() - gLastDrawMs > 2000) stayDraw(false);  // 直後に描いたばかりなら重複抑制
+    rtcBoots++;
+    if (rtcBoots % 8 == 0) {  // 約4分に1回保存
+      Serial.print("+SAVED ");
+      Serial.println(store::save(rtcCre, rtcEvent, clk::rtcUs(), rtcUnix, rtcPendingEvt) ? "ok" : "FAIL");
+    }
+    if (rtcBoots % 4 == 0) doRadioCycle();  // sleep路と同じcadence
+  }
+  led::tick(rtcCre.energy, rtcCre.sleeping, rtcCre.health < 30);
+  delay(50);
+}
