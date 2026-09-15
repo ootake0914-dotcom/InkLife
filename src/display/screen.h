@@ -113,6 +113,8 @@ inline bool init() {
 #include "art_ink_m11_sad.h"
 
 #include "art_parts.h"
+#include "art_sheet_gear.h"  // sheet_gear.png由来 (ID 0/4/8/11。gen_sheets.py生成)
+#include "art_sheet_hud.h"   // sheet_hud.png由来 (HP/SAT/EN/HA)
 
 // 12形態インデックス→装備アンカー基準形態。MORPH_5_MAPという旧名の配列は
 // 値が異なり未使用だったため削除済み。装備・fuse優劣は必ず本表を使うこと。
@@ -161,6 +163,14 @@ inline void drawXbmScaled(const unsigned char* art, int ox, int oy, int dst) {
       if (art[row + (sx >> 3)] & (1 << (sx & 7))) disp.drawPixel(px + dx, py + dy, GxEPD_BLACK);
     }
   }
+}
+// HUDステータスアイコン (モニタ域の絶対座標に1:1等倍。白背景のため黒点のみ描画)。
+inline void drawHudIcon(const unsigned char* bmp, uint8_t pw, uint8_t ph, int ox, int oy) {
+  int wb = (pw + 7) / 8;
+  for (int y = 0; y < ph; y++)
+    for (int x = 0; x < pw; x++)
+      if (pgm_read_byte(&bmp[y * wb + (x >> 3)]) & (uint8_t)(1 << (x & 7)))
+        disp.drawPixel(ox + x, oy + y, GxEPD_BLACK);
 }
 // 形態別専用アクションアート取得 (全12形態完全網羅)
 inline const unsigned char* getMorphActionArt(uint8_t mid, Action a, Mood m) {
@@ -349,25 +359,28 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
 
   // 融合表示: 刻んだピクセルアートパーツによる美しいキメラ描画
   // 同系統の自前パーツはスキップし、他形態から遺伝した特徴のみを最適な接合座標にマウント
-  // ビットマップ物は parts::PART_ROWS 駆動。手続き型 (0/4/8/11) のみ直書き。
+  // ビットマップ物は parts::PART_ROWS 駆動。シート型 (0/4/8/11) はart_sheet_gear.h駆動。
   auto gear = [&](uint8_t id) {
     if (id == mid) return;  // 自前パーツは本体アートに描画済み
-    if (id == 0) {  // まる (スライムのハイライト水玉)
-      dot(14, 76, 5, 5); dot(78, 76, 5, 5);
+    if (id == 0) {  // まる (シート水滴×2。頬のハイライト)
+      drawPart(gear0_drop_bmp, gear0_drop_mask, GEAR0_DROP_W, GEAR0_DROP_H, 6, 64);
+      drawPart(gear0_drop_bmp, gear0_drop_mask, GEAR0_DROP_W, GEAR0_DROP_H, 66, 64);
       return;
     }
-    if (id == 4) {  // しま (トラ猫の縞)
-      dot(12, 70, 14, 3); dot(70, 70, 14, 3);
+    if (id == 4) {  // しま (シート縞×2。頬のジグザグ)
+      drawPart(gear4_stripe_bmp, gear4_stripe_mask, GEAR4_STRIPE_W, GEAR4_STRIPE_H, 4, 66);
+      drawPart(gear4_stripe_bmp, gear4_stripe_mask, GEAR4_STRIPE_W, GEAR4_STRIPE_H, 68, 66);
       return;
     }
-    if (id == 8) {  // うず (お腹の渦巻き。中央下は避けてへそ位置に)
-      ring(48, 66, 3); ring(48, 66, 6);
+    if (id == 8) {  // うず (シート渦巻き。中央下は避けてへそ位置に)
+      drawPart(gear8_swirl_bmp, gear8_swirl_mask, GEAR8_SWIRL_W, GEAR8_SWIRL_H, 36, 54);
       return;
     }
-    if (id == 11) {  // ほし (四隅のキラキラ星屑)
-      const int8_t st[][2] = {{14,14},{82,14},{14,82},{82,82}};
+    if (id == 11) {  // ほし (シート星屑。四隅、数は幸福度で2〜4)
+      const int8_t st[][2] = {{0,0},{72,0},{0,72},{72,72}};
       int n = min(4, 2 + (int)c.happiness * 2 / 100);
-      for (int i = 0; i < n; i++) { dot(st[i][0] - 4, st[i][1] - 1, 9, 3); dot(st[i][0] - 1, st[i][1] - 4, 3, 9); }
+      for (int i = 0; i < n; i++)
+        drawPart(gear11_star_bmp, gear11_star_mask, GEAR11_STAR_W, GEAR11_STAR_H, st[i][0], st[i][1]);
       return;
     }
     // 睡眠時は頭が動くためHEAD装備だけ追従 (睡眠絵と同一条件で判定)
@@ -630,13 +643,17 @@ inline void draw(const Creature& c, const char* event, bool full, uint8_t friend
     else snprintf(idl, sizeof(idl), "ID %s %s", idb, gb);
     textEN(tx, 13, idl);
     snprintf(row, sizeof(row), "HP  %03d", c.health);
-    textEN(tx, 25, row); pbar(tx + 48, 19, 70, c.health);
+    drawHudIcon(hud_hp_bmp, HUD_HP_W, HUD_HP_H, tx, 12);
+    textEN(tx + 18, 25, row); pbar(tx + 66, 19, 52, c.health);
     snprintf(row, sizeof(row), "SAT %03d", 100 - c.hunger);
-    textEN(tx, 37, row); pbar(tx + 48, 31, 70, 100 - c.hunger);
+    drawHudIcon(hud_sat_bmp, HUD_SAT_W, HUD_SAT_H, tx, 24);
+    textEN(tx + 18, 37, row); pbar(tx + 66, 31, 52, 100 - c.hunger);
     snprintf(row, sizeof(row), "EN  %03d", c.energy);
-    textEN(tx, 49, row); pbar(tx + 48, 43, 70, c.energy);
+    drawHudIcon(hud_en_bmp, HUD_EN_W, HUD_EN_H, tx, 36);
+    textEN(tx + 18, 49, row); pbar(tx + 66, 43, 52, c.energy);
     snprintf(row, sizeof(row), "HA  %03d", c.happiness);
-    textEN(tx, 61, row); pbar(tx + 48, 55, 70, c.happiness);
+    drawHudIcon(hud_ha_bmp, HUD_HA_W, HUD_HA_H, tx, 48);
+    textEN(tx + 18, 61, row); pbar(tx + 66, 55, 52, c.happiness);
     snprintf(row, sizeof(row), "ACT %s", actionName(c.action));
     textEN(tx, 73, row);
     if (fld) {  // 現象窓 (ACT行右の空きに48x12盤＋活動量)

@@ -65,7 +65,40 @@ class ArtDataManager:
     def __init__(self):
         self.frames: Dict[str, bytes] = {}
         self.parts: List[dict] = []
+        self.sheet_gear: Dict[str, dict] = {}  # art_sheet_gear.h (24x24 bmp+mask)
+        self.sheet_hud: Dict[str, dict] = {}   # art_sheet_hud.h (16x16 bmp)
         self._load()
+
+    def _load_sheet(self, fname: str) -> Dict[str, dict]:
+        """gen_sheets.py生成ヘッダ (VAR_W/H + var_bmp/var_mask) を読む。"""
+        disp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "src", "display")
+        out: Dict[str, dict] = {}
+        try:
+            with open(os.path.join(disp, fname), "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError as e:
+            print(f"[VoxelArt] WARNING: {fname} load failed ({e})")
+            return out
+        dims = {}
+        for m in re.finditer(r"#define\s+(\w+_[WH])\s+(\d+)", text):
+            dims[m.group(1)] = int(m.group(2))
+        for m in re.finditer(
+                r"static const unsigned char (\w+)_bmp\[(\d+)\][\s\S]*?PROGMEM\s*=\s*\{([\s\S]*?)\};",
+                text):
+            var, _decl, body = m.group(1), m.group(2), m.group(3)
+            bmp = bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", body))
+            mm = re.search(r"static const unsigned char " + re.escape(var) +
+                           r"_mask\[(\d+)\][\s\S]*?PROGMEM\s*=\s*\{([\s\S]*?)\};", text)
+            mask = (bytes(int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{2})", mm.group(2)))
+                    if mm else None)
+            w = dims.get(var.upper() + "_W", 0)
+            h = dims.get(var.upper() + "_H", 0)
+            if w > 0 and len(bmp) == ((w + 7) // 8) * h:
+                out[var] = {"w": w, "h": h, "bmp": bmp, "mask": mask}
+            else:
+                print(f"[VoxelArt] WARNING: {fname}:{var} size mismatch")
+        return out
 
     def _load(self):
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -89,6 +122,10 @@ class ArtDataManager:
                     "anchors": row["anchors"]
                 })
             print(f"[VoxelArt] Loaded {len(self.frames)} frames and {len(self.parts)} parts from inkart.js")
+            self.sheet_gear = self._load_sheet("art_sheet_gear.h")
+            self.sheet_hud = self._load_sheet("art_sheet_hud.h")
+            print(f"[VoxelArt] Loaded {len(self.sheet_gear)} sheet-gear and "
+                  f"{len(self.sheet_hud)} sheet-hud icons")
             return
         except Exception as e:
             print(f"[VoxelArt] WARNING: inkart.js load failed ({e}), fallback to placeholder")
@@ -116,7 +153,9 @@ class ChimeraVoxelModel:
         raw = species_id % 12
         mid = ANCHOR_BASE_MAP[raw]
         effective_gears = fuse_shown_gears(fuse, mid, raw)
-        key = f"{species_id}_{mid}_{action}_{mood}_{','.join(map(str, effective_gears))}_{happiness // 25}"
+        # FW表記ゆれ対策: 正規化後の行動で鍵を作り、同一絵の無駄再ビルドを防ぐ
+        act = normalize_action(action)
+        key = f"{species_id}_{mid}_{act}_{mood}_{','.join(map(str, effective_gears))}_{happiness // 25}"
         if key == self.cache_key and self.voxels:
             return
 
@@ -257,23 +296,58 @@ class ChimeraVoxelModel:
                         gear_grid[sy][sx] = gid
             # breakしない: ペア物 (耳L/R・髭L/R) は同gearで2行ある
 
+    def _blit_sheet_gear(self, grid: List[List[int]], gear_grid: List[List[int]],
+                           var: str, ax: int, ay: int, gid: int) -> bool:
+        """シート型ギアの転写 (FW screen.h gear() と同一配置。穴は素体色のまま)。"""
+        icon = ART_DB.sheet_gear.get(var)
+        if not icon:
+            return False
+        w, h, bmp = icon["w"], icon["h"], icon["bmp"]
+        stride = (w + 7) >> 3
+        for py in range(h):
+            for px in range(w):
+                if (bmp[py * stride + (px >> 3)] >> (px & 7)) & 1:
+                    x, y = ax + px, ay + py
+                    if 0 <= y < 96 and 0 <= x < 96:
+                        grid[y][x] = 2
+                        gear_grid[y][x] = gid
+        return True
+
     def _apply_procedural_gear(self, grid: List[List[int]], gear_grid: List[List[int]], gid: int, happiness: int):
-        # ファーム screen.h の手続き型と同一座標 (dot/ringそのまま)
-        if gid == 0:  # まる (ハイライト水玉 5x5)
-            for (ox, oy) in ((14, 76), (78, 76)):
+        # シート型 (FW screen.h gear() と同一座標。art_sheet_gear.h駆動。
+        # ヘッダ不在時のみ旧手続き型へフォールバック)
+        if gid == 0:  # まる (シート水滴×2)
+            if "gear0_drop" in ART_DB.sheet_gear:
+                self._blit_sheet_gear(grid, gear_grid, "gear0_drop", 6, 64, gid)
+                self._blit_sheet_gear(grid, gear_grid, "gear0_drop", 66, 64, gid)
+                return
+            for (ox, oy) in ((14, 76), (78, 76)):  # フォールバック旧水玉
                 for dy in range(5):
                     for dx in range(5):
                         grid[oy + dy][ox + dx] = 2; gear_grid[oy + dy][ox + dx] = gid
-        elif gid == 4:  # しま (トラ猫の縞 14x3)
-            for y_off in (70, 71, 72):
+            return
+        if gid == 4:  # しま (シート縞×2)
+            if "gear4_stripe" in ART_DB.sheet_gear:
+                self._blit_sheet_gear(grid, gear_grid, "gear4_stripe", 4, 66, gid)
+                self._blit_sheet_gear(grid, gear_grid, "gear4_stripe", 68, 66, gid)
+                return
+            for y_off in (70, 71, 72):  # フォールバック旧縞
                 for x in list(range(12, 26)) + list(range(70, 84)):
                     grid[y_off][x] = 2; gear_grid[y_off][x] = gid
-        elif gid == 8:  # うず (渦巻き r=3,6 outline。へそ位置)
-            self._draw_circle(grid, gear_grid, 48, 66, 3, gid, hollow=True)
+            return
+        if gid == 8:  # うず (シート渦巻き)
+            if self._blit_sheet_gear(grid, gear_grid, "gear8_swirl", 36, 54, gid):
+                return
+            self._draw_circle(grid, gear_grid, 48, 66, 3, gid, hollow=True)  # フォールバック旧渦
             self._draw_circle(grid, gear_grid, 48, 66, 6, gid, hollow=True)
-        elif gid == 11:  # ほし (四隅の星屑 9x3+3x9 plus)
-            corners = [(14, 14), (82, 14), (14, 82), (82, 82)]
+            return
+        if gid == 11:  # ほし (シート星屑。四隅、数は幸福度で2〜4)
             n = min(4, 2 + int(happiness * 2 / 100))
+            if "gear11_star" in ART_DB.sheet_gear:
+                for cx, cy in [(0, 0), (72, 0), (0, 72), (72, 72)][:n]:
+                    self._blit_sheet_gear(grid, gear_grid, "gear11_star", cx, cy, gid)
+                return
+            corners = [(14, 14), (82, 14), (14, 82), (82, 82)]  # フォールバック旧星屑
             for i in range(n):
                 cx, cy = corners[i]
                 for dy in range(3):
@@ -282,6 +356,7 @@ class ChimeraVoxelModel:
                 for dy in range(9):
                     for dx in range(3):
                         grid[cy + dy - 4][cx + dx - 1] = 2; gear_grid[cy + dy - 4][cx + dx - 1] = gid
+            return
 
     def _draw_circle(self, grid, gear_grid, cx, cy, r, gid, hollow=False):
         for dy in range(-r, r + 1):

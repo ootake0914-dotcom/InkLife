@@ -459,7 +459,8 @@ static const uint8_t part_halo_mask[] PROGMEM = {
 // --- Table-driven mount rows (1行=1ブリット) ---
 // screen.h gear() の装着座標を一本化。ペア物 (耳・髭) は同gearIdで2行。
 // mid不一致はskip (沈黙維持)。全mid共通はmid=255 (ワイルドカード)。
-// 手続き型 (0水玉・4縞・8渦・11星) は対象外でscreen側switchに残る。
+// 手続き型 (0水玉・4縞・8渦・11星) は対象外でscreen側のシート描画
+// (art_sheet_gear.h。gen_sheets.py生成) に残る。
 struct Anchor { uint8_t mid; int8_t x; int8_t y; };
 struct PartRow {
   uint8_t gear;             // fuse id (1,2,3,5,6,7,9,10)

@@ -114,12 +114,23 @@ class VirtualEInk:
         # 96x96 キメラドット絵の描画 (標本窓の中央: x=5, y=16 付近)
         self._render_creature_art(state)
 
-        # 右側ステータスバー群 (x=162〜232)
-        tx_bar = 162
-        self.draw_pbar(tx_bar, 19, 70, state.health)
-        self.draw_pbar(tx_bar, 31, 70, 100 - state.hunger)
-        self.draw_pbar(tx_bar, 43, 70, state.energy)
-        self.draw_pbar(tx_bar, 55, 70, state.happiness)
+        # 右側ステータスバー群 (x=180〜232) + HUDアイコン (x=114)
+        tx_bar = 180
+        self.draw_pbar(tx_bar, 19, 52, state.health)
+        self.draw_pbar(tx_bar, 31, 52, 100 - state.hunger)
+        self.draw_pbar(tx_bar, 43, 52, state.energy)
+        self.draw_pbar(tx_bar, 55, 52, state.happiness)
+        # HUDステータスアイコン (FW screen.h draw() と同一配置。16x16黒点のみ)
+        for var, iy in (("hud_hp", 12), ("hud_sat", 24), ("hud_en", 36), ("hud_ha", 48)):
+            icon = ART_DB.sheet_hud.get(var)
+            if not icon:
+                continue
+            w, h, bmp = icon["w"], icon["h"], icon["bmp"]
+            stride = (w + 7) >> 3
+            for py in range(h):
+                for px in range(w):
+                    if (bmp[py * stride + (px >> 3)] >> (px & 7)) & 1:
+                        self.draw_pixel(114 + px, iy + py, True)
 
         # 現象盤ミニ窓 (ACT行右側の 48x12 盤: x=240, y=60)。実盤面のみ (FIELDB同期前は空白)
         self.draw_rect(240, 60, 50, 14)
@@ -194,16 +205,44 @@ class VirtualEInk:
                                 self.draw_pixel(ox + sx, oy + sy, True)
                     # breakしない: ペア物 (耳L/R・髭L/R) は同gearで2行ある
 
+    def _blit_sheet_gear(self, ox, oy, dst, var, ax, ay):
+        """シート型ギア転写 (FW screen.h drawPart と同一。mask白抜き→黒描画)"""
+        icon = ART_DB.sheet_gear.get(var)
+        if not icon:
+            return False
+        SC = lambda v: (v * dst) // 96
+        w, h, bmp, msk = icon["w"], icon["h"], icon["bmp"], icon["mask"]
+        stride = (w + 7) >> 3
+        for py in range(h):
+            for px in range(w):
+                if msk and ((msk[py * stride + (px >> 3)] >> (px & 7)) & 1):
+                    self.draw_pixel(ox + SC(ax + px), oy + SC(ay + py), False)
+                if (bmp[py * stride + (px >> 3)] >> (px & 7)) & 1:
+                    self.draw_pixel(ox + SC(ax + px), oy + SC(ay + py), True)
+        return True
+
     def _draw_gear_proc(self, ox, oy, dst, gid, ha):
         SC = lambda v: (v * dst) // 96
-        if gid == 0:  # まる (ハイライト水玉 5x5)
-            for (bx, by) in ((14, 76), (78, 76)):
+        if gid == 0:  # まる (シート水滴×2。FW screen.h gear() と同一配置)
+            if "gear0_drop" in ART_DB.sheet_gear:
+                self._blit_sheet_gear(ox, oy, dst, "gear0_drop", 6, 64)
+                self._blit_sheet_gear(ox, oy, dst, "gear0_drop", 66, 64)
+                return
+            for (bx, by) in ((14, 76), (78, 76)):  # フォールバック旧水玉
                 self.fill_rect(ox + SC(bx), oy + SC(by), max(1, SC(5)), max(1, SC(5)), True)
-        elif gid == 4:  # しま (トラ猫の縞 14x3)
-            for (bx, by) in ((12, 70), (70, 70)):
+            return
+        if gid == 4:  # しま (シート縞×2)
+            if "gear4_stripe" in ART_DB.sheet_gear:
+                self._blit_sheet_gear(ox, oy, dst, "gear4_stripe", 4, 66)
+                self._blit_sheet_gear(ox, oy, dst, "gear4_stripe", 68, 66)
+                return
+            for (bx, by) in ((12, 70), (70, 70)):  # フォールバック旧縞
                 self.fill_rect(ox + SC(bx), oy + SC(by), max(1, SC(14)), max(1, SC(3)), True)
-        elif gid == 8:  # うず (渦巻き r=3,6 outline。半径もSC変換)
-            cx0, cy0 = SC(48), SC(66)
+            return
+        if gid == 8:  # うず (シート渦巻き)
+            if self._blit_sheet_gear(ox, oy, dst, "gear8_swirl", 36, 54):
+                return
+            cx0, cy0 = SC(48), SC(66)  # フォールバック旧渦
             for r in (3, 6):
                 rs = max(1, SC(r))
                 for dy in range(-rs, rs + 1):
@@ -211,14 +250,20 @@ class VirtualEInk:
                         d2 = dx * dx + dy * dy
                         if (rs - 1) * (rs - 1) <= d2 <= rs * rs:
                             self.draw_pixel(ox + cx0 + dx, oy + cy0 + dy, True)
-        elif gid == 11:  # ほし (四隅 9x3+3x9 plus)
-            corners = [(14, 14), (82, 14), (14, 82), (82, 82)]
+            return
+        if gid == 11:  # ほし (シート星屑。四隅、数は幸福度で2〜4)
             n = min(4, 2 + ha * 2 // 100)
+            if "gear11_star" in ART_DB.sheet_gear:
+                for cx, cy in [(0, 0), (72, 0), (0, 72), (72, 72)][:n]:
+                    self._blit_sheet_gear(ox, oy, dst, "gear11_star", cx, cy)
+                return
+            corners = [(14, 14), (82, 14), (14, 82), (82, 82)]  # フォールバック旧星屑
             for i in range(n):
                 cx, cy = corners[i][0], corners[i][1]
                 # firmware dot()そのまま: 位置・寸法ともSC変換
                 self.fill_rect(ox + SC(cx - 4), oy + SC(cy - 1), max(1, SC(9)), max(1, SC(3)), True)
                 self.fill_rect(ox + SC(cx - 1), oy + SC(cy - 4), max(1, SC(3)), max(1, SC(9)), True)
+            return
 
     def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str) -> str:
         # 全12形態 (0〜11) が専用アクション絵を完全保持 (FW表記ゆれ対応)
