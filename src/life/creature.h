@@ -123,7 +123,9 @@ inline void creatureTick(Creature& c, uint32_t dt) {
     }
     if (c.action == Action::PLAY) {
       c.happiness = min(100, (int)c.happiness + 8);
-      if (c.energy > 4) c.energy -= 4;
+      // energy 1〜4でも消費する (旧if(energy>4)は低ENで無限幸福バグ)。
+      // 0に落ちたら次tick以降の衰弱で死ぬ。他分岐と同一の床処理。
+      c.energy = c.energy > 4 ? c.energy - 4 : 0;
     } else {
       c.happiness = c.happiness > 0 ? c.happiness - 1 : 0;
     }

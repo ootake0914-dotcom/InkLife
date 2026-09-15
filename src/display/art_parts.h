@@ -470,28 +470,28 @@ struct PartRow {
   uint8_t anchorCount;
 };
 
-static constexpr Anchor ANCH_HORN[] = {{2, 48, 5}, {4, 44, 5}, {0, 42, 12}, {7, 42, 8}};
-static constexpr Anchor ANCH_EAR_L[] = {{0, 18, 10}, {7, 16, 8}, {1, 18, 8}};
-static constexpr Anchor ANCH_EAR_R[] = {{0, 60, 10}, {7, 62, 8}, {1, 58, 8}};
+static constexpr Anchor ANCH_HORN[] = {{2, 48, 5}, {4, 44, 5}, {0, 42, 12}, {7, 42, 8}, {10, 36, 3}};
+static constexpr Anchor ANCH_EAR_L[] = {{0, 18, 10}, {7, 16, 8}, {1, 18, 8}, {10, 14, 8}, {4, 12, 6}};
+static constexpr Anchor ANCH_EAR_R[] = {{0, 60, 10}, {7, 62, 8}, {1, 58, 8}, {10, 56, 8}, {4, 66, 6}};
 static constexpr Anchor ANCH_SPIKES[] = {{255, 32, 12}};
 static constexpr Anchor ANCH_HALO[] = {{255, 34, 2}};
-static constexpr Anchor ANCH_WING[] = {{0, 68, 36}, {2, 66, 38}, {4, 64, 38}, {7, 68, 38}};
-static constexpr Anchor ANCH_CROWN[] = {{2, 37, 7}, {4, 37, 6}, {0, 38, 11}, {1, 38, 8}};
-static constexpr Anchor ANCH_TAIL[] = {{0, 75, 42}, {2, 75, 42}, {7, 74, 46}, {1, 75, 42}};
-static constexpr Anchor ANCH_WHISK_L[] = {{0, 8, 42}, {2, 10, 42}, {7, 8, 44}, {1, 12, 42}};
-static constexpr Anchor ANCH_WHISK_R[] = {{0, 68, 42}, {2, 65, 42}, {7, 70, 44}, {1, 62, 42}};
+static constexpr Anchor ANCH_WING[] = {{0, 68, 36}, {2, 66, 38}, {4, 64, 38}, {7, 68, 38}, {10, 66, 36}, {1, 60, 36}};
+static constexpr Anchor ANCH_CROWN[] = {{2, 37, 7}, {4, 37, 6}, {0, 38, 11}, {1, 38, 8}, {10, 35, 2}};
+static constexpr Anchor ANCH_TAIL[] = {{0, 75, 42}, {2, 75, 42}, {7, 74, 46}, {1, 75, 42}, {10, 72, 40}, {4, 75, 42}};
+static constexpr Anchor ANCH_WHISK_L[] = {{0, 8, 42}, {2, 10, 42}, {7, 8, 44}, {1, 12, 42}, {4, 10, 42}};
+static constexpr Anchor ANCH_WHISK_R[] = {{0, 68, 42}, {2, 65, 42}, {7, 70, 44}, {1, 62, 42}, {4, 68, 42}};
 
 static constexpr PartRow PART_ROWS[] = {
-  {1, part_horn_bmp, part_horn_mask, PART_HORN_W, PART_HORN_H, ANCH_HORN, 4},
-  {2, part_ear_l_bmp, part_ear_l_mask, PART_EAR_L_W, PART_EAR_L_H, ANCH_EAR_L, 3},
-  {2, part_ear_r_bmp, part_ear_r_mask, PART_EAR_R_W, PART_EAR_R_H, ANCH_EAR_R, 3},
+  {1, part_horn_bmp, part_horn_mask, PART_HORN_W, PART_HORN_H, ANCH_HORN, 5},
+  {2, part_ear_l_bmp, part_ear_l_mask, PART_EAR_L_W, PART_EAR_L_H, ANCH_EAR_L, 5},
+  {2, part_ear_r_bmp, part_ear_r_mask, PART_EAR_R_W, PART_EAR_R_H, ANCH_EAR_R, 5},
   {3, part_spikes_bmp, part_spikes_mask, PART_SPIKES_W, PART_SPIKES_H, ANCH_SPIKES, 1},
   {5, part_halo_bmp, part_halo_mask, PART_HALO_W, PART_HALO_H, ANCH_HALO, 1},
-  {6, part_wing_bmp, part_wing_mask, PART_WING_W, PART_WING_H, ANCH_WING, 4},
-  {7, part_crown_bmp, part_crown_mask, PART_CROWN_W, PART_CROWN_H, ANCH_CROWN, 4},
-  {9, part_tail_bmp, part_tail_mask, PART_TAIL_W, PART_TAIL_H, ANCH_TAIL, 4},
-  {10, part_whisker_l_bmp, nullptr, PART_WHISKER_L_W, PART_WHISKER_L_H, ANCH_WHISK_L, 4},
-  {10, part_whisker_r_bmp, nullptr, PART_WHISKER_R_W, PART_WHISKER_R_H, ANCH_WHISK_R, 4},
+  {6, part_wing_bmp, part_wing_mask, PART_WING_W, PART_WING_H, ANCH_WING, 6},
+  {7, part_crown_bmp, part_crown_mask, PART_CROWN_W, PART_CROWN_H, ANCH_CROWN, 5},
+  {9, part_tail_bmp, part_tail_mask, PART_TAIL_W, PART_TAIL_H, ANCH_TAIL, 6},
+  {10, part_whisker_l_bmp, nullptr, PART_WHISKER_L_W, PART_WHISKER_L_H, ANCH_WHISK_L, 5},
+  {10, part_whisker_r_bmp, nullptr, PART_WHISKER_R_W, PART_WHISKER_R_H, ANCH_WHISK_R, 5},
 };
 
 // ビットマップ装備 (1,2,3,5,6,7,9,10) の網羅をコンパイル時検証。新装備追加時は行追加。

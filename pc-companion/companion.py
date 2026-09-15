@@ -19,16 +19,24 @@ import math
 import random
 import threading
 from typing import Optional, List
+from enum import Enum, auto
 import pyray as rl
 
 # 自作モジュール
 from inkparser import (
     CreatureState, InkProtocolParser, MORPH_NAMES, GEAR_NAMES, GEAR_NAMES_EN,
-    stat_rank, condition_label, MORPH_TRAIT_APTITUDE
+    stat_rank, condition_label, MORPH_TRAIT_APTITUDE, FW_STAT_TO_DISPLAY,
+    hab_gain
 )
 from voxel_art import ChimeraVoxelModel
 from virtual_eink import VirtualEInk
 from sound_effects import SoundManager
+from tournament import Fighter, TournamentManager, TournamentUI
+
+class AppMode(Enum):
+    FARM = auto()        # 既存の3Dテラリウム生息空間
+    TOURNAMENT = auto()  # モンスターファーム２風 トーナメント大会
+
 
 try:
     import serial
@@ -137,6 +145,9 @@ class SerialWorker:
         self.running = True
         self.port_name = "AUTO"
         self.lock = threading.Lock()
+        # 状態共有ロック (CreatureState/field_grid/peers/logsは両スレッドで触る)。
+        # 無ロックだと辞書リサイズ中のRuntimeErrorや盤面行ちぎれが起きる。
+        self.state_lock = threading.Lock()
         self.tx_queue: List[str] = []
         self.log_lines: List[str] = []
         self.event_queue: List[dict] = []
@@ -164,6 +175,13 @@ class SerialWorker:
     def _find_port(self) -> Optional[str]:
         if not SERIAL_AVAILABLE:
             return None
+        # 明示指定が最優先 (--port=COM24 / 環境変数 INKLIFE_PORT)。誤爆防止。
+        for arg in sys.argv:
+            if arg.startswith("--port=") and len(arg) > 7:
+                return arg[7:]
+        forced = os.environ.get("INKLIFE_PORT")
+        if forced:
+            return forced
         ports = list(serial.tools.list_ports.comports())
         # 1. COM24 を優先 (開発機既定)
         for p in ports:
@@ -175,7 +193,21 @@ class SerialWorker:
             hwid = (p.hwid or "").lower()
             if "esp32" in desc or "jtag" in desc or "usb serial" in desc or "303a" in hwid:
                 return p.device
-        # 3. 該当なし (無関係BTポート等への誤爆送信を避けるためNone)
+            # CP210x / CH340 / FTDI 等の汎用USB-UARTも実機の可能性がある
+            if "cp210" in desc or "ch340" in desc or "ch341" in desc or "ftdi" in desc or "usb" in desc:
+                # Bluetooth SPP は除外 (誤爆送信防止)
+                if "bluetooth" not in desc and "bth" not in hwid:
+                    return p.device
+        # 3. フォールバック: Bluetooth以外の最初のCOMを試す (実機取りこぼし防止)
+        #    以前はNoneを返してOFFLINE固定になっていたため、狐実機でも
+        #    デモのスライム (species 24) が表示され続けるバグがあった。
+        for p in ports:
+            desc = (p.description or "").lower()
+            if "bluetooth" in desc:
+                continue
+            if "standard serial over bluetooth" in desc:
+                continue
+            return p.device
         return None
 
     def _run(self):
@@ -199,6 +231,7 @@ class SerialWorker:
                         self.send(f"TIME {now_unix}")
                         self.send("FZ")
                         self.send("SP")
+                        self.send("ID")
                         self.send("AFF")
                     except Exception as e:
                         self.connected = False
@@ -216,16 +249,17 @@ class SerialWorker:
                                 msg = self.tx_queue.pop(0)
                                 self.ser.write(msg.encode("utf-8"))
 
-                        # 受信行の読み出し
+                        # 受信行の読み出し (状態更新はstate_lock下で一括)
                         line_bytes = self.ser.readline()
                         if line_bytes:
                             line = line_bytes.decode("utf-8", errors="replace").strip()
                             if line:
                                 self._add_log(line)
-                                r = self.parser.parse_line(line)
-                                if r:
-                                    if r.get("type") == "event":
+                                with self.state_lock:
+                                    r = self.parser.parse_line(line)
+                                    if r and r.get("type") == "event":
                                         self.eink.push_log(r["event"], self.parser.state.age_sec)
+                                if r:
                                     with self.lock:
                                         self.event_queue.append(r)
                     else:
@@ -375,8 +409,10 @@ def main():
     sound_mgr.init_audio()
     train_cutin = TrainCutin()
 
-    # デモ用の初期設定
-    state.species_id = 24  # 第24世代ちびドラゴン (柴犬ピン耳 + 背中トゲ)
+    # デモ用の初期設定 (OFFLINE時のみ表示。ONLINEで即 +SP/+FZ 上書きされる)
+    # BUG修正: 24 % 12 == 0 スライムになっていた (意図はちびドラゴン %12==1)。
+    # 25 % 12 == 1 でドラゴン正。fuse [2,3,11] は耳/トゲ/星で全ゾーン別 = 全表示。
+    state.species_id = 25  # 第24世代ちびドラゴン (柴犬ピン耳 + 背中トゲ + 星屑)
     state.generation = 24
     state.fuse = [2, 3, 11, 255]  # 耳、トゲ、星屑
     state.last_event = "WAKE_OK"
@@ -409,6 +445,21 @@ def main():
     btn_reborn = rl.Rectangle(1040, 634, 100, 36)
     btn_photo = rl.Rectangle(1150, 634, 100, 36)
     btn_bench = rl.Rectangle(1150, 588, 100, 36)
+    btn_tourney = rl.Rectangle(930, 588, 210, 36)  # トーナメント大会エントリーボタン
+
+    # アプリケーションモード (FARM <-> TOURNAMENT)
+    # 引数に --tourney または -t がある場合は直接トーナメント大会から開始
+    if "--tourney" in sys.argv or "-t" in sys.argv:
+        with serial_worker.state_lock:
+            my_fighter = Fighter.from_creature_state(state)
+            peers_list = list(state.peers.values())
+        tourney_mgr = TournamentManager(my_fighter, peers_list)
+        tourney_ui: Optional[TournamentUI] = TournamentUI(tourney_mgr, sound_mgr)
+        app_mode = AppMode.TOURNAMENT
+    else:
+        app_mode = AppMode.FARM
+        tourney_ui: Optional[TournamentUI] = None
+
 
     screenshot_msg = ""
     screenshot_timer = 0.0
@@ -417,6 +468,8 @@ def main():
     eink_key = None
     # 現象盤要求の追跡 (+LIFE更新ごとにFIELDBを1回)
     last_field_age = -1
+    # 種・融合の定期再同期 (+SP/+FZ応答ロスでスライム固定化するのを防止。10秒毎)
+    last_sync_time = 0.0
 
     # 3D シーン用ライティングシェーダー (Key + Fill + Ambient)
     vs_code = """#version 330
@@ -473,33 +526,54 @@ void main() {
         if click_bounce > 0:
             click_bounce = max(0.0, click_bounce - dt * 4.0)
 
-        # シリアルイベントの受信・ディスパッチ
-        for ev in serial_worker.pop_events():
-            etype = ev.get("type")
-            if etype == "dock":
-                sound_mgr.play("dock")
-                state.speech_bubble = f"PocketStation Docked! [{ev.get('port', 'COM')}]"
-                state.speech_timer = 4.0
-            elif etype == "train":
-                res = ev.get("res", "SUCCESS")
-                stat = ev.get("stat", "INT")
-                gain = ev.get("gain", 0)
-                train_cutin.trigger(res, stat, gain, sound_mgr)
+        # シリアルイベントの受信・ディスパッチ (状態に触るためstate_lock下)
+        with serial_worker.state_lock:
+            pending_evts = serial_worker.pop_events()
+            for ev in pending_evts:
+                etype = ev.get("type")
+                if etype == "dock":
+                    sound_mgr.play("dock")
+                    state.speech_bubble = f"PocketStation Docked! [{ev.get('port', 'COM')}]"
+                    state.speech_timer = 4.0
+                elif etype == "train":
+                    res = ev.get("res", "SUCCESS")
+                    # FWは AGGR/CURIO/SOC、PC表示は POW/SPD/SKI。統一して表示する。
+                    raw_stat = ev.get("stat", "INT")
+                    stat = FW_STAT_TO_DISPLAY.get(raw_stat, raw_stat)
+                    gain = ev.get("gain", 0)
+                    train_cutin.trigger(res, stat, gain, sound_mgr)
 
         train_cutin.update(dt)
+
+        # トーナメント大会モードの更新 & 描画
+        if app_mode == AppMode.TOURNAMENT and tourney_ui is not None:
+            should_exit = tourney_ui.update(dt, serial_worker)
+            rl.begin_drawing()
+            tourney_ui.draw(WIN_W, WIN_H)
+            rl.end_drawing()
+            if should_exit:
+                app_mode = AppMode.FARM
+                tourney_ui = None
+            continue
 
         # マウス入力 & 3D カメラ制御
         mouse_pos = rl.get_mouse_position()
         in_3d_area = (mouse_pos.x < 650)  # 左側 3D 領域
 
+        # 撫で判定は上部UI(タイトル/MF2パネル/吹き出し/カットイン帯 y<270)を除外。
+        # ドラッグ回転・ズームは全域で有効のまま。
+        pet_zone = in_3d_area and mouse_pos.y > 270
+
         if rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT) and in_3d_area:
             mouse_dragging = True
             last_mouse_pos = mouse_pos
-            # キメラクリック判定 (跳ねるリアクション)
-            click_bounce = 1.0
-            state.speech_bubble = "*purr* So happy to see you!"
-            state.happiness = min(100, state.happiness + 2)
-            state.speech_timer = 3.5
+            if pet_zone:
+                # キメラクリック判定 (跳ねるリアクション)
+                click_bounce = 1.0
+                with serial_worker.state_lock:
+                    state.speech_bubble = "*purr* So happy to see you!"
+                    state.happiness = min(100, state.happiness + 2)
+                    state.speech_timer = 3.5
 
         if rl.is_mouse_button_released(rl.MOUSE_BUTTON_LEFT):
             mouse_dragging = False
@@ -522,67 +596,97 @@ void main() {
         cam.position.z = math.cos(cam_angle) * math.cos(cam_pitch) * cam_dist
         cam.target = rl.Vector3(0.0, 0.75, 0.0)
 
-        # ボタン入力判定
+        # ボタン入力判定 (FW実効値と一致させる。旧楽観値はhabGain無視で乖離)
         if rl.check_collision_point_rec(mouse_pos, btn_feed) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
             serial_worker.send("FEED")
-            state.hunger = max(0, state.hunger - 30)
-            state.happiness = min(100, state.happiness + 10)
-            state.action = "EAT"
-            state.speech_bubble = "*munch munch* Delicious snack!"
-            state.speech_timer = 3.5
+            with serial_worker.state_lock:
+                if state.hunger == 0:
+                    state.happiness = min(100, state.happiness + hab_gain(2, state.habit[0]))
+                else:
+                    state.hunger = max(0, state.hunger - 30)
+                    state.happiness = min(100, state.happiness + hab_gain(5, state.habit[0]))
+                    state.habit[0] = min(100, state.habit[0] + 25)
+                state.action = "FEED"  # FW表記 (E-Ink一致。art解決は正規化)
+                state.speech_bubble = "*munch munch* Delicious snack!"
+                state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_play) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
             serial_worker.send("PLAY")
-            state.happiness = min(100, state.happiness + 15)
-            state.energy = max(0, state.energy - 10)
-            state.action = "PLAY"
-            state.speech_bubble = "Yay! Playing games is awesome!"
-            state.speech_timer = 3.5
+            with serial_worker.state_lock:
+                if state.energy < 10:
+                    state.speech_bubble = "Tired... need sleep..."
+                else:
+                    state.happiness = min(100, state.happiness + hab_gain(25, state.habit[1]))
+                    state.habit[1] = min(100, state.habit[1] + 25)
+                    state.energy = max(0, state.energy - 10)
+                    state.action = "PLAY"
+                    state.speech_bubble = "Yay! Playing games is awesome!"
+                state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_train) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
             serial_worker.send("TRAIN")
             # オフライン時 (シミュレータ時) はPC側でMF2ダイスロール & 即時カットイン
+            # FW ui::train() と同一式 (エネルギー/幸福度依存の可変確率 + 幸福度増減)。
             if not serial_worker.connected:
-                raw_sp = state.species_id % 12
-                best_t = MORPH_TRAIT_APTITUDE[raw_sp] if 0 <= raw_sp < 12 else (0, 1)
-                target = best_t[0] if random.random() < 0.7 else best_t[1]
-                t_names = ["INT", "POW", "SPD", "SKI"]
-                target_name = t_names[target]
+                with serial_worker.state_lock:
+                    raw_sp = state.species_id % 12
+                    best_t = MORPH_TRAIT_APTITUDE[raw_sp] if 0 <= raw_sp < 12 else (0, 1)
+                    target = best_t[0] if random.random() < 0.7 else best_t[1]
+                    t_names = ["INT", "POW", "SPD", "SKI"]
+                    target_name = t_names[target]
 
-                if state.energy < 15:
-                    state.health = max(1, state.health - 5)
-                    train_cutin.trigger("OVERWORK", target_name, 0, sound_mgr)
-                    state.speech_bubble = "Too exhausted... Overworked!"
-                else:
-                    state.energy = max(0, state.energy - 18)
-                    state.hunger = min(100, state.hunger + 12)
-                    r = random.random()
-                    if r < 0.08:
-                        train_cutin.trigger("SLACK", target_name, 0, sound_mgr)
-                        state.speech_bubble = "Played hooky today~ (SLACK)"
-                    elif r < 0.28:
-                        gain = random.choice([3, 4])
-                        if target == 0: state.intelligence = min(100, state.intelligence + gain)
-                        elif target == 1: state.aggression = min(100, state.aggression + gain)
-                        elif target == 2: state.curiosity = min(100, state.curiosity + gain)
-                        elif target == 3: state.sociability = min(100, state.sociability + gain)
-                        train_cutin.trigger("GREAT", target_name, gain, sound_mgr)
-                        state.speech_bubble = f"GREAT SUCCESS !! {target_name} +{gain} UP!"
-                    elif r < 0.85:
-                        gain = random.choice([1, 2])
-                        if target == 0: state.intelligence = min(100, state.intelligence + gain)
-                        elif target == 1: state.aggression = min(100, state.aggression + gain)
-                        elif target == 2: state.curiosity = min(100, state.curiosity + gain)
-                        elif target == 3: state.sociability = min(100, state.sociability + gain)
-                        train_cutin.trigger("SUCCESS", target_name, gain, sound_mgr)
-                        state.speech_bubble = f"Training complete! {target_name} +{gain} UP!"
+                    if state.energy < 15:
+                        state.health = max(1, state.health - 5)
+                        state.happiness = max(0, state.happiness - 10)
+                        state.action = "STANDBY"  # FW表記 (ui::train OVERWORK)
+                        train_cutin.trigger("OVERWORK", target_name, 0, sound_mgr)
+                        state.speech_bubble = "Too exhausted... Overworked!"
                     else:
-                        train_cutin.trigger("FAIL", target_name, 0, sound_mgr)
-                        state.speech_bubble = "Couldn't make it this time... (FAIL)"
-                state.speech_timer = 3.5
+                        # FW ui::train と同一コスト (15。旧18から緩和に追従)
+                        state.energy = max(0, state.energy - 15)
+                        state.hunger = min(100, state.hunger + 12)
+                        state.happiness = max(0, state.happiness - 5)
+                        # FW準拠: サボり→大成功→成功→失敗の順に残り確率で判定
+                        slack_chance = (50 - state.happiness) / 3 + 3 if state.happiness < 50 else 3
+                        r100 = random.uniform(0, 100)
+                        if r100 < slack_chance:
+                            state.happiness = min(100, state.happiness + 8)
+                            state.action = "PLAY"
+                            train_cutin.trigger("SLACK", target_name, 0, sound_mgr)
+                            state.speech_bubble = "Played hooky today~ (SLACK)"
+                        else:
+                            r100 -= slack_chance
+                            great_chance = 20 if (state.happiness >= 70 and state.energy >= 50) else 6
+                            if r100 < great_chance:
+                                gain = random.choice([4, 5])
+                                if target == 0: state.intelligence = min(100, state.intelligence + gain)
+                                elif target == 1: state.aggression = min(100, state.aggression + gain)
+                                elif target == 2: state.curiosity = min(100, state.curiosity + gain)
+                                elif target == 3: state.sociability = min(100, state.sociability + gain)
+                                state.happiness = min(100, state.happiness + 15)
+                                state.action = "PLAY"
+                                train_cutin.trigger("GREAT", target_name, gain, sound_mgr)
+                                state.speech_bubble = f"GREAT SUCCESS !! {target_name} +{gain} UP!"
+                            else:
+                                r100 -= great_chance
+                                success_chance = 40 + (state.energy * 4 / 10)
+                                if r100 < success_chance:
+                                    gain = random.choice([2, 3])
+                                    if target == 0: state.intelligence = min(100, state.intelligence + gain)
+                                    elif target == 1: state.aggression = min(100, state.aggression + gain)
+                                    elif target == 2: state.curiosity = min(100, state.curiosity + gain)
+                                    elif target == 3: state.sociability = min(100, state.sociability + gain)
+                                    state.action = "PLAY"
+                                    train_cutin.trigger("SUCCESS", target_name, gain, sound_mgr)
+                                    state.speech_bubble = f"Training complete! {target_name} +{gain} UP!"
+                                else:
+                                    state.action = "STANDBY"  # FW表記
+                                    train_cutin.trigger("FAIL", target_name, 0, sound_mgr)
+                                    state.speech_bubble = "Couldn't make it this time... (FAIL)"
+                    state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_time) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
@@ -608,29 +712,49 @@ void main() {
             sound_mgr.play("click")
             serial_worker.send("BENCH")
 
-        # 3D ボクセルモデルのビルド (キャッシュにより変化時のみ再生成)
-        voxel_model.build(
-            state.species_id,
-            state.action,
-            state.mood,
-            state.fuse,
-            state.happiness
-        )
+        if rl.check_collision_point_rec(mouse_pos, btn_tourney) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
+            with serial_worker.state_lock:
+                my_fighter = Fighter.from_creature_state(state)
+                peers_list = list(state.peers.values())
+            tourney_mgr = TournamentManager(my_fighter, peers_list)
+            tourney_ui = TournamentUI(tourney_mgr, sound_mgr)
+            app_mode = AppMode.TOURNAMENT
 
-        # 現象盤の実盤面を要求 (+LIFE更新ごと。FIELDB 12行で返る。接続中のみ)
-        if state.age_sec != last_field_age:
-            last_field_age = state.age_sec
-            if serial_worker.connected:
-                serial_worker.send("FIELDB")
 
-        # バーチャル E-Ink の更新 (内容変化時のみ再構築＋転送。盤面到着も含む)
-        ekey = (state.age_sec, state.action, state.mood, tuple(state.fuse),
-                state.last_event, len(state.peers), state.health, state.hunger,
-                state.energy, state.happiness, state.generation, state.species_id,
-                state.field_seq)
-        if ekey != eink_key:
-            eink_key = ekey
-            eink.render(state)
+        # 3Dモデル・盤面要求・E-Ink更新は多欄一貫読みのためstate_lock下
+        with serial_worker.state_lock:
+            # 3D ボクセルモデルのビルド (キャッシュにより変化時のみ再生成)
+            voxel_model.build(
+                state.species_id,
+                state.action,
+                state.mood,
+                state.fuse,
+                state.happiness
+            )
+
+            # 現象盤の実盤面を要求 (+LIFE更新ごと。FIELDB 12行で返る。接続中のみ)
+            if state.age_sec != last_field_age:
+                last_field_age = state.age_sec
+                if serial_worker.connected:
+                    serial_worker.send("FIELDB")
+
+        # 種・融合の定期再同期 (初回応答ロス対策。接続中10秒毎にSP/FZ/AFF/ID再要求)
+            if serial_worker.connected and (sim_time - last_sync_time) > 10.0:
+                last_sync_time = sim_time
+                serial_worker.send("SP")
+                serial_worker.send("FZ")
+                serial_worker.send("ID")
+                serial_worker.send("AFF")
+
+            # バーチャル E-Ink の更新 (内容変化時のみ再構築＋転送。盤面到着も含む)
+            ekey = (state.age_sec, state.action, state.mood, tuple(state.fuse),
+                    state.last_event, len(state.peers), state.health, state.hunger,
+                    state.energy, state.happiness, state.generation, state.species_id,
+                    state.field_seq)
+            if ekey != eink_key:
+                eink_key = ekey
+                eink.render(state)
 
         # セリフ吹き出しタイマー
         if state.speech_timer > 0:
@@ -841,7 +965,8 @@ void main() {
         )
 
         rl.draw_text("LoRa MESH RADAR / PEERS", 676, panel_radar_y + 12, 14, COL_ACCENT)
-        peers_list = list(state.peers.values())
+        with serial_worker.state_lock:
+            peers_list = list(state.peers.values())
         rl.draw_text(f"Registered Peers: {len(peers_list)} / 6", 880, panel_radar_y + 12, 12, COL_TXT_DIM)
 
         if not peers_list:
@@ -908,6 +1033,7 @@ void main() {
         draw_button(btn_train, "TRAIN", rl.Color(255, 180, 50, 255))
         draw_button(btn_reborn, "REBORN", rl.Color(255, 110, 220, 255))
         draw_button(btn_photo, "SNAPSHOT", COL_ACCENT_AMB)
+        draw_button(btn_tourney, "TOURNAMENT", rl.Color(255, 215, 0, 255))
         draw_button(btn_bench, "BENCH", COL_ACCENT)
 
         draw_button(btn_feed, "FEED", rl.Color(255, 140, 90, 255))

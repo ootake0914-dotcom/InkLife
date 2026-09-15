@@ -71,7 +71,9 @@ inline bool load(Creature& c, char* event, size_t evlen, uint64_t& rrtc, uint32_
   c.sociability = p.getUChar("so", 40);
   strncpy(c.name, "INK", sizeof(c.name));
   c.age_sec = p.getULong("age", 0);
-  c.action = (Action)p.getUChar("act", 0);
+  // NVS破損時の不正Action固着を防止 (BREEDを超えたらIDLE)。
+  uint8_t actv = p.getUChar("act", 0);
+  c.action = (actv <= (uint8_t)Action::BREED) ? (Action)actv : Action::IDLE;
   c.sleeping = p.getUChar("slp", 0) != 0;
   rrtc = p.getULong64("rrtc", 0);
   runix = p.getULong("runix", 0);

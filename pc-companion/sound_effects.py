@@ -15,31 +15,35 @@ import pyray as rl
 
 
 def _synth_wav(
-    notes: list,  # [(freq, duration_ms, wave_type, volume)]
+    notes: list,  # [(freq_or_tuple, duration_ms, wave_type, volume)]
     sample_rate: int = 44100
 ) -> bytes:
-    """複数の周波数・音長シーケンスから 16-bit PCM WAV バイト列を合成"""
+    """複数の周波数・音長シーケンスから 16-bit PCM WAV バイト列を合成 (ピッチスライド対応)"""
     buf = io.BytesIO()
     with wave.open(buf, 'wb') as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(sample_rate)
-        
+
         all_data = bytearray()
         for note in notes:
-            freq, dur_ms, wtype, vol = note
-            n_samples = int(sample_rate * dur_ms / 1000)
+            freq_spec, dur_ms, wtype, vol = note
+            n_samples = max(1, int(sample_rate * dur_ms / 1000))
             phase = 0.0
-            phase_inc = 2.0 * math.pi * freq / sample_rate
-            
+
+            f_start, f_end = (freq_spec, freq_spec) if isinstance(freq_spec, (int, float)) else freq_spec
+
             for i in range(n_samples):
                 t_rel = i / n_samples
+                cur_freq = f_start + (f_end - f_start) * t_rel
+                phase_inc = 2.0 * math.pi * cur_freq / sample_rate
+
                 # エンベロープ (急速アタック、自然減衰)
-                if t_rel < 0.08:
-                    env = t_rel / 0.08
+                if t_rel < 0.06:
+                    env = t_rel / 0.06
                 else:
-                    env = max(0.0, 1.0 - (t_rel - 0.08) / 0.92)
-                
+                    env = max(0.0, 1.0 - (t_rel - 0.06) / 0.94)
+
                 # 波形生成
                 if wtype == 'square':  # ファミコン風矩形波 (Duty 50%)
                     raw = 1.0 if (phase % (2.0 * math.pi)) < math.pi else -1.0
@@ -52,12 +56,12 @@ def _synth_wav(
                     raw = ((i * 1103515245 + 12345) & 0x7FFF) / 16384.0 - 1.0
                 else:  # サイン波
                     raw = math.sin(phase)
-                
+
                 phase += phase_inc
                 sample = int(raw * env * vol * 28000)
                 sample = max(-32767, min(32767, sample))
                 all_data.extend(struct.pack('<h', sample))
-                
+
         w.writeframes(all_data)
     return buf.getvalue()
 
@@ -139,6 +143,49 @@ class SoundManager:
             (880.0, 45, 'pulse', 0.55),
             (1174.7, 50, 'pulse', 0.65),
             (1760.0, 90, 'pulse', 0.75),
+        ]))
+
+        # 8. 試合開始ゴング (ノイズ+矩形波 240Hz→75Hz 下降スライド 800ms)
+        self._register("battle_gong", _synth_wav([
+            ((240, 75), 800, 'square', 0.80),
+        ]))
+
+        # 9. 技発動(近接) (440Hz 矩形波 80ms)
+        self._register("move_melee", _synth_wav([
+            (440, 80, 'square', 0.65),
+        ]))
+
+        # 10. 技発動(遠距離) (300Hz→900Hz 三角波 220ms)
+        self._register("move_ranged", _synth_wav([
+            ((300, 900), 220, 'triangle', 0.70),
+        ]))
+
+        # 11. 打撃ヒット音 (ノイズ+低音パルス 70ms)
+        self._register("hit_punch", _synth_wav([
+            (120, 70, 'noise', 0.90),
+        ]))
+
+        # 12. 遠距離ヒット爆発音 (ノイズ+低周波減衰 280ms)
+        self._register("hit_magic", _synth_wav([
+            ((200, 60), 280, 'noise', 0.95),
+        ]))
+
+        # 13. 回避スライド音 (600Hz→200Hz 140ms)
+        self._register("evade", _synth_wav([
+            ((600, 200), 140, 'triangle', 0.55),
+        ]))
+
+        # 14. K.O.音 (500Hz→40Hz急降下 650ms)
+        self._register("battle_ko", _synth_wav([
+            ((500, 40), 650, 'square', 0.90),
+        ]))
+
+        # 15. 大会優勝ファンファーレ (C5-E5-G5-C6 華やかな和音アルペジオ 700ms)
+        self._register("tourney_win", _synth_wav([
+            (523.25, 120, 'square', 0.70),
+            (659.25, 120, 'square', 0.75),
+            (783.99, 140, 'square', 0.80),
+            (1046.50, 320, 'pulse', 0.90),
         ]))
 
     def play(self, name: str):

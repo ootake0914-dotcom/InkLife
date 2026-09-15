@@ -68,8 +68,8 @@ inline const char* train(Creature& c, int targetTrait = -1) {
     return "OVERWORK";
   }
 
-  // 2. コスト消費 (特訓による疲労と空腹)
-  c.energy = (c.energy >= 18) ? c.energy - 18 : 0;
+  // 2. コスト消費 (特訓による疲労と空腹。simで周回率を測って18->15に緩和)
+  c.energy = (c.energy >= 15) ? c.energy - 15 : 0;
   c.hunger = min(100, (int)c.hunger + 12);
   c.happiness = (c.happiness >= 5) ? c.happiness - 5 : 0;
 
@@ -89,7 +89,7 @@ inline const char* train(Creature& c, int targetTrait = -1) {
   // (B) 大成功判定 (調子・元気が良いと発生率アップ)
   uint8_t greatChance = (c.happiness >= 70 && c.energy >= 50) ? 20 : 6;
   if (r < greatChance) {
-    uint8_t gain = 3 + (esp_random() % 2);  // +3〜4
+    uint8_t gain = 4 + (esp_random() % 2);  // +4〜5 (旧+3〜4。simで伸びの見えなさを改善)
     if (target == 0) c.intelligence = min(100, (int)c.intelligence + gain);
     else if (target == 1) c.aggression = min(100, (int)c.aggression + gain);
     else if (target == 2) c.curiosity = min(100, (int)c.curiosity + gain);
@@ -104,7 +104,7 @@ inline const char* train(Creature& c, int targetTrait = -1) {
   // (C) 成功判定 (Energyが高いほど高確率)
   uint8_t successChance = 40 + (c.energy * 4 / 10);
   if (r < successChance) {
-    uint8_t gain = 1 + (esp_random() % 2);  // +1〜2
+    uint8_t gain = 2 + (esp_random() % 2);  // +2〜3 (旧+1〜2)
     if (target == 0) c.intelligence = min(100, (int)c.intelligence + gain);
     else if (target == 1) c.aggression = min(100, (int)c.aggression + gain);
     else if (target == 2) c.curiosity = min(100, (int)c.curiosity + gain);

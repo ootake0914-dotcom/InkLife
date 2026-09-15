@@ -22,6 +22,13 @@ inline uint32_t fnvMix(uint32_t h, uint32_t v) { return (h ^ v) * 16777619UL; }
 
 // allowBle=falseでBLEを飛ばす (NVSキルスイッチ用)。
 inline void survey(Survey& out, bool allowBle) {
+  // static再利用時の前回値残存を消去 (弱電波・BLE無効時のstale防止)。
+  out.seed = 0;
+  out.wifiN = 0;
+  out.wifiMax = -127;
+  out.bleN = 0;
+  out.bleMax = -127;
+  out.bleOk = false;
   uint32_t h = 2166136261UL;
   h = fnvMix(h, (uint32_t)ESP.getEfuseMac());
   h = fnvMix(h, esp_random());
@@ -44,7 +51,6 @@ inline void survey(Survey& out, bool allowBle) {
   h = fnvMix(h, esp_random());
 
   // BLE受動スキャン (2秒)。失敗しても続行。
-  out.bleOk = false;
   if (allowBle) {
     static bool bleInitDone = false;
     if (!bleInitDone) {
