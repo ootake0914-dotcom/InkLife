@@ -36,7 +36,8 @@ inline bool init() {
 #include "art_ink_eat.h"
 #include "art_ink_sleep.h"
 #include "art_ink_sad.h"
-#include "art_ink_greet.h"
+// 注: art_ink_greet.hはP0でFW表示から外した (全形態オーバーレイ統一)。ファイル自体は残し、
+// tools/make_artjs.cjs経由でPC側inkart.jsには引き続き同梱される。
 
 // 形態別専用アート (全12形態: idle, sleep, eat, happy, sad 完全網羅)
 #include "art_ink_m00_idle.h"
@@ -113,21 +114,9 @@ inline bool init() {
 
 #include "art_parts.h"
 
-// 12形態インデックスを完成済み大形態へ正規化 (装備アンカー用)
-static const uint8_t MORPH_5_MAP[12] = {
-  0, // 0: まる (スライム)
-  1, // 1: つの (ちびドラゴン)
-  2, // 2: みみ (柴犬)
-  1, // 3: とげ -> ドラゴン
-  4, // 4: しま (トラ猫)
-  2, // 5: わっか -> 柴犬 (装備アンカー用)
-  7, // 6: ひれ -> カエル王子
-  7, // 7: おうかん (カエル王子)
-  0, // 8: うず -> スライム
-  1, // 9: あし -> ドラゴン
-  2, // 10: ひげ -> 柴犬 (装備アンカー用)
-  0  // 11: ほし -> スライム
-};
+// 12形態インデックス→装備アンカー基準形態。MORPH_5_MAPという旧名の配列は
+// 値が異なり未使用だったため削除済み。装備・fuse優劣は必ず本表を使うこと。
+// (旧MORPH_5_MAPの6/9/10 = 7/1/2 は誤り。正は1/4/10)
 
 static const unsigned char* const MORPH_IDLE_XBM[12] = {
   ink_m00_idle_xbm,  // 0: まる (スライム)
@@ -194,11 +183,12 @@ inline const unsigned char* getMorphActionArt(uint8_t mid, Action a, Mood m) {
       if (isSad) return ink_m01_sad_xbm;
       break;
     case 2:  // みみ (柴犬)
+      // P0: 旧mid==2専用COMM絵 (ink_greet_xbm) は廃止。全形態は自前IDLE＋アンテナ
+      // 波紋オーバーレイに統一し、通信中も素体 (遺伝子) を見せる。greet絵はPC用に残置。
       if (isSleep) return ink_m02_sleep_xbm;
       if (isEat) return ink_m02_eat_xbm;
       if (isHappy) return ink_m02_happy_xbm;
       if (isSad) return ink_m02_sad_xbm;
-      if (a == Action::COMM) return ink_greet_xbm;
       break;
     case 3:  // とげ (トゲドラゴン)
       if (isSleep) return ink_m03_sleep_xbm;
@@ -276,6 +266,25 @@ static const uint8_t ANCHOR_BASE_MAP[12] = {
   0   // 11: ほし -> スライム
 };
 
+// 睡眠時HEAD追従オフセット (dx,dy)。睡眠絵では頭が動くため、HEAD装備
+// (つの/みみ/おうかん) のアンカーに加算する。mid順 {0,1,2,4,7,10}。
+// 値は睡眠絵12枚への重ね合わせで目視決定 (tools/sleep_offset_check.py)。
+// 他ゾーン (胴体装備) は動かないため対象外。PC側 (inkparser.py SLEEP_HEAD_OFF) と同期。
+static constexpr int8_t SLEEP_HEAD_OFF[6][2] = {
+  {0, 10},   // 0: スライム系 (頭が沈む)
+  {-4, 10},  // 1: ドラゴン系 (左に丸まる)
+  {0, 5},    // 2: 柴犬系 (ほぼ動かない)
+  {-6, 16},  // 4: トラ猫系 (左下に頭。ゴーレムは妥協)
+  {0, 14},   // 7: カエル (頭が沈む)
+  {-2, 5},   // 10: 狐 (ほぼ動かない)
+};
+inline uint8_t headMidIndex(uint8_t mid) {
+  switch (mid) {
+    case 0: return 0; case 1: return 1; case 2: return 2;
+    case 4: return 3; case 7: return 4; default: return 5;  // 10
+  }
+}
+
 inline void sprite(const Creature& c, Mood m, int ox, int oy) {
   const unsigned char* art = nullptr;
   Action a = c.action;
@@ -316,23 +325,8 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
   auto drawPart = [&](const uint8_t* bmp, const uint8_t* mask, uint8_t pw, uint8_t ph, int px, int py) {
     if (!bmp) return;
     int wb = (pw + 7) / 8;
-    // パス1: 白マスクで下地をクリア (余計な線をくり抜いて自然に繋ぐ)
-    if (mask) {
-      for (int y = 0; y < ph; y++) {
-        int sy = py + y;
-        if (sy < 0 || sy >= 96) continue;
-        int dy = by + SC(sy);
-        for (int x = 0; x < pw; x++) {
-          int sx = px + x;
-          if (sx < 0 || sx >= 96) continue;
-          int dx = bx + SC(sx);
-          if (pgm_read_byte(&mask[y * wb + (x >> 3)]) & (1 << (x & 7))) {
-            disp.drawPixel(dx, dy, GxEPD_WHITE);
-          }
-        }
-      }
-    }
-    // パス2: 黒ピクセルを描画 (輪郭を綺麗に接続)
+    // マスク消去＋黒描画を単一走査化 (旧2パス→1パス。画素毎に白→黒の順で同一結果。
+    // 同一画素の白後黒は黒に確定し、画素間の操作は可換のため2パスと等価)
     for (int y = 0; y < ph; y++) {
       int sy = py + y;
       if (sy < 0 || sy >= 96) continue;
@@ -341,8 +335,13 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
         int sx = px + x;
         if (sx < 0 || sx >= 96) continue;
         int dx = bx + SC(sx);
-        if (pgm_read_byte(&bmp[y * wb + (x >> 3)]) & (1 << (x & 7))) {
-          disp.drawPixel(dx, dy, GxEPD_BLACK);
+        int bi = y * wb + (x >> 3);
+        uint8_t bit = (uint8_t)(1 << (x & 7));
+        if (mask && (pgm_read_byte(&mask[bi]) & bit)) {
+          disp.drawPixel(dx, dy, GxEPD_WHITE);  // 下地クリア (余計な線をくり抜く)
+        }
+        if (pgm_read_byte(&bmp[bi]) & bit) {
+          disp.drawPixel(dx, dy, GxEPD_BLACK);  // 輪郭を綺麗に接続
         }
       }
     }
@@ -371,21 +370,30 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
       for (int i = 0; i < n; i++) { dot(st[i][0] - 4, st[i][1] - 1, 9, 3); dot(st[i][0] - 1, st[i][1] - 4, 3, 9); }
       return;
     }
+    // 睡眠時は頭が動くためHEAD装備だけ追従 (睡眠絵と同一条件で判定)
+    int sdx = 0, sdy = 0;
+    if ((a == Action::SLEEP || m == Mood::SLEEPY) && genetics::zoneOf(id) == 0) {
+      uint8_t mi = headMidIndex(mid);
+      sdx = SLEEP_HEAD_OFF[mi][0]; sdy = SLEEP_HEAD_OFF[mi][1];
+    }
     for (unsigned i = 0; i < sizeof(parts::PART_ROWS) / sizeof(parts::PART_ROWS[0]); i++) {
       const parts::PartRow& r = parts::PART_ROWS[i];
       if (r.gear != id) continue;
       for (uint8_t a = 0; a < r.anchorCount; a++) {
         if (r.anchors[a].mid != mid && r.anchors[a].mid != 255) continue;
-        drawPart(r.bmp, r.mask, r.w, r.h, r.anchors[a].x, r.anchors[a].y);
+        drawPart(r.bmp, r.mask, r.w, r.h, r.anchors[a].x + sdx, r.anchors[a].y + sdy);
         break;  // 1行1ブリット
       }
     }
   };
 
-  // 融合遺伝子 fuse[0..3] を順に描画。新保存はスロットi＝ゾーンi。
+  // 融合遺伝子 fuse[0..3] を表示候補に集める。新保存はスロットi＝ゾーンi。
   // 旧保存の同ゾーン重複は先勝ちで1つだけ出す (ゾーン優劣)。
   // raw自身（c.species_id%12）と正規化midはスキップ (本体アートに描画済み、または専用絵で独立)。
+  // 睡眠時も頭装備は装着のまま (枕演出は96pxでは判読不能のため不採用)。
   uint8_t wonZoneMask = 0;
+  uint8_t showList[4]; uint8_t showN = 0;
+  bool hasHeadTop = false;  // 王冠・角の表示有無 (ハロー譲歩則用)
   for (int i = 0; i < 4; i++) {
     uint8_t f = c.fuse[i];
     if (f > 11 || f == raw || f == mid) continue;
@@ -395,7 +403,21 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
     uint8_t z = genetics::zoneOf(f);
     if (wonZoneMask & (uint8_t)(1 << z)) continue;  // 同部位は1装備まで
     wonZoneMask |= (uint8_t)(1 << z);
-    gear(f);
+    showList[showN++] = f;
+    if (f == 7 || f == 1) hasHeadTop = true;
+  }
+  // 奥→手前 (AURA→BACK→BELLY→HEAD) で描画し、正しい重なり (occlusion) にする。
+  // 旧スロット順 (HEAD→AURA) は背景マスクが前景を白抜きする事故 (王冠×ハロー等) があった。
+  // 頭頂競合: ハローは王冠・角と頭頂で重なるため、両者表示時はハローが譲る (遺伝子は保持)。
+  //   ※PC側 fuse_shown_gears と同一則にすること。
+  static const uint8_t ZORDER[4] = {3, 1, 2, 0};
+  for (uint8_t zi = 0; zi < 4; zi++) {
+    for (uint8_t k = 0; k < showN; k++) {
+      uint8_t f = showList[k];
+      if (genetics::zoneOf(f) != ZORDER[zi]) continue;
+      if (f == 5 && hasHeadTop) continue;  // ハロー譲歩
+      gear(f);
+    }
   }
 
   // アクション演出オーバーレイ (専用アクション絵を持たない形態向け。dedicatedがある場合は自前画像で表現)
@@ -449,8 +471,8 @@ inline const char* morphName(uint16_t species) {
     default: return "PET";
   }
 }
-inline void morphTag(const Creature& c, char* b) {  // b[10]。cyd式: 戻りString禁止
-  snprintf(b, 10, "%s-%02d", morphName(c.species_id), c.species_id % 12);
+inline void morphTag(const Creature& c, char* b) {  // b[12]。"WHISKER-10"(10字)+NUL
+  snprintf(b, 12, "%s-%02d", morphName(c.species_id), c.species_id % 12);
 }
 
 inline const char* stageName(uint32_t age_sec) {
@@ -468,6 +490,12 @@ inline void textEN(int x, int y, const char* s) {
 inline void fmtHMS(uint32_t sec, char* b) {  // b[10]
   uint32_t h = sec / 3600; if (h > 99) h = 99;
   snprintf(b, 10, "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)(sec / 60) % 60, (unsigned long)sec % 60);
+}
+// 分丸め時刻 (b[6] "HH:MM")。E-Ink再描画の間引きと対で使う: 秒表示は30秒tick毎に
+// 必ず変わるためskip判定を殺す。環境生物の時計に秒精度は要らない。
+inline void fmtHM(uint32_t sec, char* b) {  // b[6]
+  uint32_t h = sec / 3600; if (h > 99) h = 99;
+  snprintf(b, 6, "%02lu:%02lu", (unsigned long)h, (unsigned long)(sec / 60) % 60);
 }
 inline void fmt3(int v, char* b) {  // b[4]
   snprintf(b, 4, "%03d", v);
@@ -497,8 +525,32 @@ inline void pushLog(const char* e, uint32_t age) {
 }
 inline void logLine(int i, char* b) {  // b[28]
   if (!evLog[i][0]) { b[0] = 0; return; }
-  char h[10]; fmtHMS(evLogAge[i], h);
+  char h[6]; fmtHM(evLogAge[i], h);  // 分丸め (秒はskip判定と矛盾するため)
   snprintf(b, 28, ">T+%s %s", h, evLog[i]);
+}
+
+// 表示内容hash (再描画skip判定用)。画素に表れる値だけを混ぜ、画素に表れない値は混ぜない:
+// 数値4種(表示通り生値)・分丸め年齢・成長段・行動・気分・4形質(TRT表示)・最終イベント・
+// 表示2行ログ(分丸め)・知人数。除外するもの: 現象盤 (装飾。追従更新で十分)、cleanliness
+// (非表示)、ID/世代/素体名 (世代内不変。転生はfull描画)。stateHash(監査用)とは別物。
+// dispHash一致 ⇒ 画素一致 (現象窓を除く) が成立するようdraw()と1:1対応させること。
+inline uint32_t dispHash(const Creature& c, const char* event, uint8_t friends) {
+  uint32_t h = 2166136261UL;
+  auto mix = [&](uint32_t v) { h = (h ^ v) * 16777619UL; };
+  mix(c.health); mix((uint32_t)(100 - c.hunger)); mix(c.energy); mix(c.happiness);
+  mix(c.age_sec / 60);
+  mix(c.age_sec / 270);  // growthSize段差 (分丸めと非同期のため明示)
+  mix((uint32_t)c.action);
+  mix((uint32_t)creatureMood(c));
+  mix(c.intelligence); mix(c.curiosity); mix(c.aggression); mix(c.sociability);
+  for (int i = 0; i < 4; i++) mix(c.fuse[i]);  // 装備パーツはfuse確定のため
+  for (const char* p = event; *p; p++) mix((uint32_t)(uint8_t)*p);
+  for (int i = 0; i < 2; i++) {
+    for (const char* p = evLog[i]; *p; p++) mix((uint32_t)(uint8_t)*p);
+    mix(evLogAge[i] / 60);
+  }
+  mix(friends);
+  return h;
 }
 
 // 初誕生スプラッシュ (NVSにも居ない完全新規時のみ)。
@@ -509,7 +561,7 @@ inline void splash(const Creature& c) {
   do {
     disp.fillScreen(GxEPD_WHITE);
     disp.drawRect(0, 0, 296, 128, GxEPD_BLACK);
-    char l1[28], l2[16], mt[10];
+    char l1[28], l2[16], mt[12];
     morphTag(c, mt);
     snprintf(l1, sizeof(l1), "SPEC %s // GEN-01", c.name);
     snprintf(l2, sizeof(l2), "MORPH %s", mt);
@@ -550,18 +602,18 @@ inline void draw(const Creature& c, const char* event, bool full, uint8_t friend
   if (full) disp.setFullWindow();
   else disp.setPartialWindow(0, 0, disp.width(), disp.height());
   Mood m = creatureMood(c);
-  char idb[9], gb[5], mt[10], hms[10];
+  char idb[9], gb[5], mt[12], hm[6];
   snprintf(idb, sizeof(idb), "%08lX", (unsigned long)c.device_id);
   snprintf(gb, sizeof(gb), "G%02d", c.generation);
   morphTag(c, mt);
-  fmtHMS(c.age_sec, hms);
+  fmtHM(c.age_sec, hm);  // 分丸め (秒表示は間引き描画と矛盾するため)
   disp.firstPage();
   do {
     disp.fillScreen(GxEPD_WHITE);
     disp.drawRect(0, 0, 296, 128, GxEPD_BLACK);
     // 標本窓
-    char up[13], sp[16], idl[24], row[24], l0[28], l1[28], tr[8];
-    snprintf(up, sizeof(up), "T+%s", hms);
+    char up[8], sp[16], idl[24], row[24], l0[28], l1[28], tr[8];
+    snprintf(up, sizeof(up), "T+%s", hm);
     textEN(6, 11, "SPECIMEN");
     textEN(236, 11, up);
     sprite(c, m, 4, 16);
@@ -596,7 +648,7 @@ inline void draw(const Creature& c, const char* event, bool full, uint8_t friend
     traitLabel(c, tr);
     snprintf(row, sizeof(row), "ST %s TRT %s", stateCode(m), tr);
     textEN(tx, 85, row);
-    snprintf(row, sizeof(row), "STG %s %s%s", stageName(c.age_sec), hms,
+    snprintf(row, sizeof(row), "STG %s %s%s", stageName(c.age_sec), hm,
              creatureNight(c.age_sec) ? " NGT" : " DAY");
     textEN(tx, 97, row);
     logLine(0, l0); textEN(tx, 110, l0);

@@ -15,7 +15,7 @@ import math
 from collections import deque
 from typing import Dict, List, Tuple, Optional
 import pyray as rl
-from inkparser import MORPH_5_MAP, fuse_shown_gears, zone_of
+from inkparser import ANCHOR_BASE_MAP, fuse_shown_gears, zone_of, normalize_action, sleep_head_off
 
 # 形態ごとのベースカラーパレット (本体基本色, ハイライト色, 影色, インクライン色)
 MORPH_COLORS = {
@@ -85,6 +85,7 @@ class ArtDataManager:
                     "w": row["w"],
                     "h": row["h"],
                     "bmp": bytes.fromhex(row["bmp"]),
+                    "mask": bytes.fromhex(row["mask"]) if row.get("mask") else None,
                     "anchors": row["anchors"]
                 })
             print(f"[VoxelArt] Loaded {len(self.frames)} frames and {len(self.parts)} parts from inkart.js")
@@ -93,7 +94,12 @@ class ArtDataManager:
             print(f"[VoxelArt] WARNING: inkart.js load failed ({e}), fallback to placeholder")
 
     def get_frame_bytes(self, name: str) -> Optional[bytes]:
-        return self.frames.get(name) or self.frames.get("ink_m01_idle")
+        hit = self.frames.get(name)
+        if hit is None:
+            # 同期ずれの隠蔽防止: フォールバック時は警告して検出可能にする
+            print(f"[VoxelArt] WARNING: frame '{name}' missing, fallback to ink_m01_idle")
+            hit = self.frames.get("ink_m01_idle")
+        return hit
 
 # グローバルアートデータ
 ART_DB = ArtDataManager()
@@ -108,7 +114,7 @@ class ChimeraVoxelModel:
 
     def build(self, species_id: int, action: str, mood: str, fuse: List[int], happiness: int = 70):
         raw = species_id % 12
-        mid = MORPH_5_MAP[raw]
+        mid = ANCHOR_BASE_MAP[raw]
         effective_gears = fuse_shown_gears(fuse, mid, raw)
         key = f"{species_id}_{mid}_{action}_{mood}_{','.join(map(str, effective_gears))}_{happiness // 25}"
         if key == self.cache_key and self.voxels:
@@ -127,6 +133,7 @@ class ChimeraVoxelModel:
         # 2. 96x96 グリッドの構築 (0=背景, 1=黒インク, 2=キメラパーツ)
         grid = [[0 for _ in range(96)] for _ in range(96)]
         gear_grid = [[-1 for _ in range(96)] for _ in range(96)]
+        cleared = set()  # マスク消去済み画素 (肉体判定から除外。FWの白抜き相当)
 
         # 黒インクピクセルの展開
         for y in range(96):
@@ -156,11 +163,13 @@ class ChimeraVoxelModel:
                     q.append((nx, ny))
 
         # 4. キメラパーツの展開 & マスク合成
+        # 睡眠時はHEAD装備だけ追従オフセット (FW sprite()と同一条件)
+        asleep = (normalize_action(action) == "SLEEP" or mood == "SLEEPY")
         for gid in effective_gears:
             if gid in (0, 4, 8, 11):
                 self._apply_procedural_gear(grid, gear_grid, gid, happiness)
             else:
-                self._apply_bitmap_gear(grid, gear_grid, gid, mid)
+                self._apply_bitmap_gear(grid, gear_grid, gid, mid, asleep, cleared)
 
         # 5. 3D ボクセル (立体レリーフ) の生成
         base_c, high_c, shad_c, line_c = MORPH_COLORS.get(raw, MORPH_COLORS.get(mid, MORPH_COLORS[1]))
@@ -174,7 +183,7 @@ class ChimeraVoxelModel:
                 val = grid[y][x]
                 is_ink = (val == 1)
                 is_part = (val == 2)
-                is_body = (not visited[y][x] and val == 0)
+                is_body = (not visited[y][x] and val == 0 and (x, y) not in cleared)
 
                 if not is_ink and not is_part and not is_body:
                     continue
@@ -182,22 +191,22 @@ class ChimeraVoxelModel:
                 wx = (x - 48.0) * voxel_scale
                 gid = gear_grid[y][x]
 
-                # 体のふっくらとした厚み (中心が厚く、外周が薄い楕円ドーム構造)
+                # 体のふっくらとした本格的3D厚み (中心が厚く、外周が薄い球状・楕円体ドーム構造)
                 dx_norm = (x - 48.0) / 40.0
                 dy_norm = (y - 50.0) / 42.0
                 dist_c = math.sqrt(dx_norm * dx_norm + dy_norm * dy_norm)
-                base_thick = max(0.04, 0.12 * math.cos(min(1.0, dist_c) * math.pi * 0.42))
+                base_thick = max(0.16, 0.58 * math.cos(min(1.0, dist_c) * math.pi * 0.46))
 
                 if is_part and gid >= 0:
                     # キメラパーツ (角、耳、トゲ、王冠など): 前面や背面に立体的に突出
                     part_c = GEAR_COLORS.get(gid, high_c)
-                    z_offset = self._gear_z_depth(gid)
-                    thick = base_thick * 0.9 + 0.03
+                    z_offset = self._gear_z_depth(gid) * 1.8
+                    thick = base_thick * 0.95 + 0.08
                     self.voxels.append(Voxel(wx, wy, z_offset, box_wh, box_wh, thick, part_c, gid))
                 elif is_ink:
                     # 黒インク線 (輪郭・目・口・鱗・模様): 表面に少し浮き彫り (エンボス)
-                    thick = base_thick + 0.016
-                    self.voxels.append(Voxel(wx, wy, 0.008, box_wh, box_wh, thick, line_c, -1))
+                    thick = base_thick + 0.035
+                    self.voxels.append(Voxel(wx, wy, 0.02, box_wh, box_wh, thick, line_c, -1))
                 else:
                     # 体内 (ソリッドな肉体): 形態ごとのベースカラー
                     self.voxels.append(Voxel(wx, wy, 0.0, box_wh, box_wh, base_thick, base_c, -1))
@@ -208,7 +217,10 @@ class ChimeraVoxelModel:
                 ang = i * (math.pi * 2 / 8)
                 self.stars.append((math.cos(ang) * 0.9, 0.8 + (i % 3) * 0.3, math.sin(ang) * 0.9, i * 0.8))
 
-    def _apply_bitmap_gear(self, grid: List[List[int]], gear_grid: List[List[int]], gid: int, mid: int):
+    def _apply_bitmap_gear(self, grid: List[List[int]], gear_grid: List[List[int]], gid: int, mid: int, asleep: bool = False, cleared=None):
+        # FW drawPartと同一: マスク消去 (肉体のみ。線画はcleared記録で肉体化を防ぐ) → 黒描画
+        if cleared is None:
+            cleared = set()
         for row in ART_DB.parts:
             if row["gear"] != gid:
                 continue
@@ -221,10 +233,13 @@ class ChimeraVoxelModel:
                 continue
 
             ax, ay = target_anch[1], target_anch[2]
+            if asleep and zone_of(gid) == 0:
+                dx, dy = sleep_head_off(mid)
+                ax, ay = ax + dx, ay + dy
             pw, ph = row["w"], row["h"]
             stride = (pw + 7) >> 3
             bmp = row["bmp"]
-
+            msk = row.get("mask")
             for py in range(ph):
                 sy = ay + py
                 if sy < 0 or sy >= 96:
@@ -233,6 +248,10 @@ class ChimeraVoxelModel:
                     sx = ax + px
                     if sx < 0 or sx >= 96:
                         continue
+                    if msk and (msk[py * stride + (px >> 3)] >> (px & 7)) & 1:
+                        if grid[sy][sx] == 1:  # 線画のみ消去 (肉体は温存)
+                            grid[sy][sx] = 0
+                            cleared.add((sx, sy))
                     if (bmp[py * stride + (px >> 3)] >> (px & 7)) & 1:
                         grid[sy][sx] = 2
                         gear_grid[sy][sx] = gid
@@ -291,16 +310,17 @@ class ChimeraVoxelModel:
 
     def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str) -> str:
         # 全12形態 (0〜11) が専用アクション絵を完全保持
-        if action == "SLEEP" or mood == "SLEEPY":
+        # FWは STANDBY/FEED/UPLINK 表記、PC内部は IDLE/EAT/COMM。両方受ける。
+        act = normalize_action(action)
+        if act == "SLEEP" or mood == "SLEEPY":
             return f"ink_m{raw:02d}_sleep"
-        if action == "EAT":
+        if act == "EAT":
             return f"ink_m{raw:02d}_eat"
-        if action == "PLAY" or mood == "HAPPY":
+        if act == "PLAY" or mood == "HAPPY":
             return f"ink_m{raw:02d}_happy"
         if mood in ("SAD", "SICK"):
             return f"ink_m{raw:02d}_sad"
-        if action == "COMM" and raw == 2:
-            return "ink_greet"
+        # P0 FW統一: COMMは全形態自前IDLE。旧raw==2 greet特例廃止
         return f"ink_m{raw:02d}_idle"
 
     def draw(self, pos: rl.Vector3, scale: float, rot_y: float = 0.0, breathe: float = 0.0,
@@ -325,7 +345,7 @@ class ChimeraVoxelModel:
             # 呼吸と伸縮
             lx = v.x * scale * breathe_scale_x
             ly = v.y * scale * breathe_scale_y
-            lz = (v.z - v.d * 0.5) * scale
+            lz = v.z * scale
 
             # Z軸回転 (roll: 横倒れ・ズコー)
             zx = lx * cos_z - ly * sin_z

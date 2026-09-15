@@ -9,7 +9,7 @@ Raylib テクスチャとして画面上にリアルタイム描画します。
 import math
 from typing import List, Tuple
 import pyray as rl
-from inkparser import CreatureState, base_morph_of, fuse_shown_gears
+from inkparser import CreatureState, base_morph_of, fuse_shown_gears, normalize_action, sleep_head_off, zone_of
 from voxel_art import ART_DB
 
 EPD_W = 296
@@ -159,7 +159,8 @@ class VirtualEInk:
                 if (byte >> (sx & 7)) & 1:
                     self.draw_pixel(ox + dx, oy + dy, True)
 
-        # キメラパーツの追加
+        # キメラパーツの追加 (睡眠時はHEAD装備だけ追従オフセット。FW sprite()と同一)
+        asleep = (normalize_action(state.action) == "SLEEP" or state.mood == "SLEEPY")
         effective_gears = fuse_shown_gears(state.fuse, mid, raw)
         for gid in effective_gears:
             if gid in (0, 4, 8, 11):
@@ -176,13 +177,19 @@ class VirtualEInk:
                     if not anch:
                         continue
                     ax, ay = anch[1], anch[2]
+                    if asleep and zone_of(gid) == 0:
+                        dx, dy = sleep_head_off(mid)
+                        ax, ay = ax + dx, ay + dy
                     pw, ph = row["w"], row["h"]
                     stride = (pw + 7) >> 3
                     bmp = row["bmp"]
+                    msk = row.get("mask")
                     for py in range(ph):
                         sy = (ay + py) * dst // 96
                         for px in range(pw):
                             sx = (ax + px) * dst // 96
+                            if msk and (msk[py * stride + (px >> 3)] >> (px & 7)) & 1:
+                                self.draw_pixel(ox + sx, oy + sy, False)
                             if (bmp[py * stride + (px >> 3)] >> (px & 7)) & 1:
                                 self.draw_pixel(ox + sx, oy + sy, True)
                     # breakしない: ペア物 (耳L/R・髭L/R) は同gearで2行ある
@@ -214,12 +221,13 @@ class VirtualEInk:
                 self.fill_rect(ox + SC(cx - 1), oy + SC(cy - 4), max(1, SC(3)), max(1, SC(9)), True)
 
     def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str) -> str:
-        # 全12形態 (0〜11) が専用アクション絵を完全保持
-        if action == "SLEEP" or mood == "SLEEPY": return f"ink_m{raw:02d}_sleep"
-        if action == "EAT": return f"ink_m{raw:02d}_eat"
-        if action == "PLAY" or mood == "HAPPY": return f"ink_m{raw:02d}_happy"
+        # 全12形態 (0〜11) が専用アクション絵を完全保持 (FW表記ゆれ対応)
+        act = normalize_action(action)
+        if act == "SLEEP" or mood == "SLEEPY": return f"ink_m{raw:02d}_sleep"
+        if act == "EAT": return f"ink_m{raw:02d}_eat"
+        if act == "PLAY" or mood == "HAPPY": return f"ink_m{raw:02d}_happy"
         if mood in ("SAD", "SICK"): return f"ink_m{raw:02d}_sad"
-        if action == "COMM" and raw == 2: return "ink_greet"
+        # P0 FW統一: COMMは全形態自前IDLE (実機はアンテナ波紋オーバーレイ)。旧raw==2 greet特例廃止
         return f"ink_m{raw:02d}_idle"
 
     def _update_texture(self):
@@ -274,9 +282,9 @@ class VirtualEInk:
 
         hms = f"{min(state.age_sec // 3600, 99):02d}:{(state.age_sec // 60) % 60:02d}:{state.age_sec % 60:02d}"
 
-        # 標本窓ラベル
+        # 標本窓ラベル (実機 screen.h:565-566 と同一座標。T+は右上 x=236)
         rl.draw_text("SPECIMEN", dest_x + int(6 * S), dest_y + int(4 * S), fs, COLOR_INK)
-        rl.draw_text(f"T+{hms}", dest_x + int(48 * S), dest_y + int(4 * S), fs, COLOR_INK)
+        rl.draw_text(f"T+{hms}", dest_x + int(236 * S) - rl.measure_text(f"T+{hms}", fs), dest_y + int(4 * S), fs, COLOR_INK)
         rl.draw_text(f"G{state.generation:02d} {state.base_name}-{state.species_id%12:02d}",
                      dest_x + int(6 * S), dest_y + int(116 * S), fs, COLOR_INK)
 
@@ -291,8 +299,12 @@ class VirtualEInk:
         rl.draw_text(f"ACT {state.action}", tx, dest_y + int(64 * S), fs, COLOR_INK)
         rl.draw_text(f"FLD {state.field_activity:3d}", dest_x + int(200 * S), dest_y + int(64 * S), fs, COLOR_INK)
 
-        # 形質コード + 状態コード (FW stateCode準拠) + 概日 (誕生起点24h・後半8hが夜)
-        trt = f"IN{state.intelligence:02d} CU{state.curiosity:02d}"
+        # 形質コード + 状態コード (FW traitLabel準拠: 最大形質1項目) + 概日
+        m_val, m_code = state.curiosity, "CUR"
+        if state.sociability > m_val: m_val, m_code = state.sociability, "SOC"
+        if state.intelligence > m_val: m_val, m_code = state.intelligence, "INT"
+        if state.aggression > m_val: m_val, m_code = state.aggression, "AGG"
+        trt = f"{m_code} {m_val:03d}"
         state_code = {"HAPPY": "OPTIMAL", "SAD": "STRESSED", "SLEEPY": "REST",
                       "SICK": "CRITICAL"}.get(state.mood, "NOMINAL")
         rl.draw_text(f"ST {state_code} TRT {trt}", tx, dest_y + int(76 * S), fs, COLOR_INK)

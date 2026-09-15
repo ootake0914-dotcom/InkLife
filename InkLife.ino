@@ -22,11 +22,11 @@ RTC_DATA_ATTR uint32_t rtcBoots = 0;
 RTC_DATA_ATTR char rtcEvent[32] = {0};
 RTC_DATA_ATTR uint32_t rtcUnix = 0;  // 最後にTIMEで知ったunix秒 (不在計算用)
 RTC_DATA_ATTR uint8_t rtcPendingEvt = 0;  // 未送EVENT符号 (誕生時に1。次無線で送出)
-RTC_DATA_ATTR field::State rtcField;      // 現象盤 (576B)
+RTC_DATA_ATTR field::State rtcField;      // 現象盤 (144B。旧コメント576Bは1bit時代の名残)
 RTC_DATA_ATTR bool rtcFieldInit = false;  // 盤面初期化済み
 RTC_DATA_ATTR bool rtcAllowBle = true;    // BLEスキャン許可 (NVSキルスイッチ連動)
 // 知人帳 (M6): 聞いた他個体を最大6件記憶。電源断で忘れる (引っ越し扱い)。
-// cyd式パッキング: rssiはdBm整数、countは255飽和。20B/件。
+// cyd式パッキング: rssiはdBm整数、countは255飽和。28B/件 (ABI末尾pad含む)。
 struct PeerInfo {
   uint32_t did;
   uint32_t lastAge;  // 最終目撃時の自年齢
@@ -38,22 +38,36 @@ struct PeerInfo {
   bool hasTr;
   bool hasSpecies;  // HELLOで種既知か (STATUSのみ知人はfalse)
   int8_t aff;       // 好感度-100〜+100。tickで0へ減衰、停電で忘れる (M10)
+  uint8_t fz[4];    // 融合遺伝子 (v3 STATUS受信時のみ有効。255=空き)
+  bool hasFz;
 };
-static_assert(sizeof(PeerInfo) == 20, "PeerInfo must be 20B (20B payload, no pad)");
+static_assert(sizeof(PeerInfo) == 28, "PeerInfo must be 28B (25B payload + 3B pad)");
 RTC_DATA_ATTR PeerInfo rtcPeers[6];
 RTC_DATA_ATTR uint8_t rtcPeerN = 0;
+RTC_DATA_ATTR uint32_t rtcLastDispHash = 0;  // 最終転送時の表示hash (deep sleep越えのskip判定用)
+RTC_DATA_ATTR bool rtcHaveDrawn = false;     // 一度でも転送済みか
 static const bool SLEEP_ENABLE = false;  // 通常はOFF (常時起動)。電池運用でtrueに。
-static const uint32_t RTC_MAGIC = 0x494E4B51;  // "INKQ" (aff追加で更新。旧RTC破棄→NVS復元)
+static const uint32_t RTC_MAGIC = 0x494E4B53;  // "INKS" (表示hash追加で更新。旧RTC破棄→NVS復元)
 static const uint32_t TICK_SEC = 30;
-static const uint32_t CATCHUP_MAX_STEPS = 24;  // 不在12時間分で打ち止め
+static const uint32_t CATCHUP_MAX_STEPS = 24;  // 24*30s=12分相当で打ち止め (長期不在は甘め。旧コメント「12時間分」は誤り)
 bool gDispOk = false;
 bool gStayAwake = false;  // trueでsleepせず常時起動 (開発・PC接続用)
 unsigned long gStayTick = 0;
 static unsigned long gLastDrawMs = 0;  // 最終描画時刻 (tick重複抑制用)
 uint32_t gDrawCount = 0;   // 描画回数 (PX監査用。再起動で0)
 uint32_t gStallCount = 0;  // 3秒超え描画の回数 (パネル失速検出。GxEPD2はtimeout突破する)
+uint32_t gSkipCount = 0;   // 内容不変で省略した転送回数 (PX監査用。再起動で0)
+uint32_t gFullCount = 0;   // full転送回数 (PX監査用。残像清掃の周期確認用)
+static uint32_t gXferCount = 0;  // 実転送数 (stay-awake路のfull周期用)
+static const uint32_t PERIODIC_FULL_EVERY = 12;  // 12転送毎にfullで残像清掃 (通常約25分毎)
+uint32_t gEventSeq = 0;    // setEvent毎に+1 (単調)。描画要否判定用。再起動で0
+static Action gDrawnAction = Action::IDLE;  // 最終転送時のスナップ (通常tickの間引き用)
+static Mood gDrawnMood = Mood::NORMAL;
+static uint32_t gDrawnEventSeq = 0;
+static uint32_t gTicksSinceDraw = 0;
+static const uint32_t ROUTINE_DRAW_TICKS = 4;  // 通常tickは4tick毎 (約2分毎) のみ転送。重要変化は即時
 uint8_t gPendBtn = 0;  // 受信窓中の押下保持 (取りこぼし防止)
-void stayDraw(bool full);  // 後方定義 (loop中の描画は時刻を刻む)
+void stayDraw(bool full, bool force = false);  // 後方定義 (loop中の描画は時刻を刻む)
 
 void logLife() {
   Serial.print("+LIFE age=");
@@ -99,7 +113,9 @@ const genetics::Genes* findMateGenes() {
   g.sociability = rtcPeers[best].so;
   // STATUSのみ知人は種未知。ones-digit偏り防止に自種で代用 (見た目系統のみに影響)
   g.species = rtcPeers[best].hasSpecies ? rtcPeers[best].species : rtcCre.species_id;
-  for (int i = 0; i < 4; i++) g.fuse[i] = 255;  // 電文にfuseは無い。相手主形態はbreed側でmorphOfする
+  // v3 STATUSのfuseを継承。v1/v2旧FW相手 (hasFz=false) は空き扱い (breed側で相手体形のみ寄与)
+  for (int i = 0; i < 4; i++)
+    g.fuse[i] = rtcPeers[best].hasFz ? rtcPeers[best].fz[i] : 255;
   return &g;
 }
 
@@ -141,14 +157,19 @@ void doRebirth(const genetics::Genes* mate) {
                     {rtcCre.fuse[0], rtcCre.fuse[1], rtcCre.fuse[2], rtcCre.fuse[3]}};
   genetics::Genes B = mate ? *mate : A;
   genetics::Genes C = genetics::breed(A, B, inkRand);
-  // 環境圧: 現象盤の対称性・活動量でspeciesを微調整 (見た目に環境が出る)
+  // 環境圧: 現象盤の対称性・活動量でvariantのみ微調整 (P0: morph保全。旧species直接加算は
+  // bias±10でmorph(=species%12)がほぼ毎回ずれる事故があった。variant=species/12は将来の
+  // 見た目差分 (P1) 領域。morphはbreed結果のまま固定する。
   {
     uint8_t sym = field::symmetry(rtcField);
     uint16_t act = field::activity(rtcField);
     int bias = (int)(sym * 3 / 101) * 7 + (act > 200 ? 2 : act > 80 ? 1 : 0) * 3 - 10;
-    int nsp = (int)C.species + bias;
-    nsp %= 1000;
-    if (nsp < 0) nsp += 1000;
+    int morph = (int)C.species % 12;
+    int variant = (int)C.species / 12;  // 0..83
+    int nvar = (variant + bias) % 84;
+    if (nvar < 0) nvar += 84;
+    int nsp = nvar * 12 + morph;
+    while (nsp >= 1000) nsp -= 12;  // 1000..1007域のみ。morph保全でvariantを1段下げる
     C.species = (uint16_t)nsp;
     Serial.print("+FIELD sym=");
     Serial.print(sym);
@@ -198,24 +219,41 @@ void doRebirth(const genetics::Genes* mate) {
 void setEvent(const char* e) {
   strncpy(rtcEvent, e, sizeof(rtcEvent) - 1);
   rtcEvent[sizeof(rtcEvent) - 1] = 0;
+  gEventSeq++;  // 描画要否判定用 (全イベントはここを通る)
   screen::pushLog(e, rtcCre.age_sec);
   Serial.print("+EVT ");
   Serial.println(rtcEvent);
 }
 
-// 常時起動中の描画はここ経由で時刻を刻む (tickの重複再描画を抑える)。
+// 描画はここ経由。転送回数・残像の両面で節約する (E-Inkの電力・時間・寿命対策):
+//  - backstop: dispHash一致→画素同一のため転送省略 (force/fullは無条件転送)
+//  - cadence: 呼び出し側が通常tickを間引き (ROUTINE_DRAW_TICKS)。重要変化は即時
+//  - 周期full: 12転送毎にfullで残像清掃 (partial連続のゴースト蓄積対策)
+// 転送時は行動・気分・イベント世代・tick数をスナップし、loop側の要否判定に使う。
 // ついでに転送時間を計測し、3秒超えはstall計上＋報告 (パネル失速の検出)。
-void stayDraw(bool full) {
+void stayDraw(bool full, bool force) {
+  uint32_t dh = screen::dispHash(rtcCre, rtcEvent, rtcPeerN);
+  if (!full && !force && rtcHaveDrawn && dh == rtcLastDispHash) {
+    gSkipCount++;  // 画素同一。パネルは既にこの内容を表示している
+    return;
+  }
+  // 周期full (stay-awake路。sleep路はsetup側のboots周期で担うためここはRAM回数のみ)
+  bool doFull = full || (gXferCount % PERIODIC_FULL_EVERY == 0);
   unsigned long t0 = micros();
-  if (gDispOk) screen::draw(rtcCre, rtcEvent, full, rtcPeerN, &rtcField);
+  if (gDispOk) screen::draw(rtcCre, rtcEvent, doFull, rtcPeerN, &rtcField);
   unsigned long dt = micros() - t0;
   gDrawCount++;
+  gXferCount++;
+  if (doFull) gFullCount++;
   if (gDispOk && dt > 3000000UL) {
     gStallCount++;
     Serial.print("+STALL dt=");
     Serial.println(dt);
   }
   gLastDrawMs = millis();
+  rtcLastDispHash = dh; rtcHaveDrawn = true;
+  gDrawnAction = rtcCre.action; gDrawnMood = creatureMood(rtcCre);
+  gDrawnEventSeq = gEventSeq; gTicksSinceDraw = 0;
 }
 
 // 描画内容hash (PX監査用)。vitals＋年齢＋行動＋イベント＋現象＋知人数。
@@ -248,11 +286,23 @@ bool learnPeer(const mesh::Peer& p) {
         rtcPeers[i].ag = p.ag; rtcPeers[i].so = p.so;
         rtcPeers[i].hasTr = true;
       }
+      // v1/v2旧FW (hasFz=false) では上書きせず既知fuseを保持する
+      if (p.hasFz) {
+        for (int k = 0; k < 4; k++) rtcPeers[i].fz[k] = p.fz[k];
+        rtcPeers[i].hasFz = true;
+      }
       return false;
     }
   }
-  PeerInfo np{p.did, rtcCre.age_sec, p.species, p.gen, (int8_t)p.rssi, 1,
-              p.ti, p.cu, p.ag, p.so, p.hasTr, p.type == mesh::T_HELLO, 0};
+  // 集約初期化はメンバ追加時の順序事故を招くため、代入式で構築する
+  PeerInfo np{};
+  np.did = p.did; np.lastAge = rtcCre.age_sec;
+  np.species = p.species; np.gen = p.gen;
+  np.rssi = (int8_t)p.rssi; np.count = 1;
+  np.ti = p.ti; np.cu = p.cu; np.ag = p.ag; np.so = p.so;
+  np.hasTr = p.hasTr; np.hasSpecies = (p.type == mesh::T_HELLO); np.aff = 0;
+  for (int k = 0; k < 4; k++) np.fz[k] = p.hasFz ? p.fz[k] : 255;
+  np.hasFz = p.hasFz;
   if (rtcPeerN < 6) {
     rtcPeers[rtcPeerN++] = np;
   } else {
@@ -281,8 +331,9 @@ void addAff(uint32_t did, int d) {
     if (after > 100) after = 100;
     if (after < -100) after = -100;
     rtcPeers[i].aff = (int8_t)after;
-    if (before < 50 && after >= 50) setEvent("BONDED");
-    else if (before > -50 && after <= -50) setEvent("RIVAL");
+    // 同一イベント連打のチャタリング防止 (decayAffとの往復でBONDED連発するため)。
+    if (before < 50 && after >= 50) { if (strcmp(rtcEvent, "BONDED") != 0) setEvent("BONDED"); }
+    else if (before > -50 && after <= -50) { if (strcmp(rtcEvent, "RIVAL") != 0) setEvent("RIVAL"); }
     return;
   }
 }
@@ -359,19 +410,23 @@ void reactPeer(const mesh::Peer& p) {
     case mesh::T_FIGHT: {
       // 勝敗 = aggression＋乱数＋系統相性。荒事は命懸け。種未知の相手には相性なし (五分)。
       // 親友 (aff≥30) とは手加減試合: 痛み半減。いじめ (勝利) は好感度を失う。
-      uint32_t mine = rtcCre.aggression + esp_random() % 30;
-      uint32_t theirs = p.x1 + esp_random() % 30;
+      // バランス調整 (tools/balance_sim.pyで検証): 振れ幅30->40で番狂わせを残し、
+      // 系統ボーナス+15->+8 (旧は互角でも優位側88%勝率の必勝級だった)。
+      uint32_t mine = rtcCre.aggression + esp_random() % 40;
+      uint32_t theirs = p.x1 + esp_random() % 40;
       uint8_t pf = 0;
       if (peerFamily(p.did, pf) &&
-          genetics::familyBeats(genetics::familyOf(rtcCre.species_id), pf)) mine += 15;
+          genetics::familyBeats(genetics::familyOf(rtcCre.species_id), pf)) mine += 8;
       int8_t fa = peerAff(p.did);
       if (mine >= theirs) {
         rtcCre.happiness = min(100, (int)rtcCre.happiness + 10);
         setEvent("COMBAT_WIN");
         addAff(p.did, -5);
       } else {
+        // 敗北: 痛みは親友の手加減 (aff≥30かつHPに余裕で2、それ以外は5)。
+        // 下限1で踏み止まる (死はtickの衰弱に一任。旧if(health>dmg)は低HPで無傷になるバグ)。
         int dmg = (fa >= 30 && rtcCre.health > 2) ? 2 : 5;
-        if (rtcCre.health > dmg) rtcCre.health -= dmg;
+        rtcCre.health = (rtcCre.health > dmg) ? rtcCre.health - dmg : 1;
         setEvent("COMBAT_LOSS");
         addAff(p.did, -10);
       }
@@ -488,8 +543,11 @@ uint32_t pollTime(uint32_t window_ms) {
           char* e = p + strlen(p);
           while (e > p && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
           if (strncmp(p, "TIME ", 5) == 0) {
-            long u = atol(p + 5);
-            if (u > 1000000000L) ret = (uint32_t)u;
+            // atolは巨大値で飽和/UBのためstrtoul＋範囲検査 (2038年問題は運用で許容)。
+            char* ep = nullptr;
+            unsigned long u = strtoul(p + 5, &ep, 10);
+            if (ep != p + 5 && *ep == 0 && u > 1000000000UL && u <= 4294967295UL)
+              ret = (uint32_t)u;
           } else if (strcmp(p, "STAY") == 0) {
             gStayAwake = true;
             Serial.println("+STAY nosleep");
@@ -553,8 +611,9 @@ void setup() {
     rtcFieldInit = true;
   }
   // 現象をcore0で4ステップ進行 (電源断復帰後の不在分は別途catch-up済みの tick 扱い)
+  // faはstatic必須 (jobs::runタイムアウト後もcore0が参照するためスタック禁止)。
   {
-    jobs::FieldArg fa{&rtcField, 4};
+    static jobs::FieldArg fa{&rtcField, 4};
     if (jobs::run(jobs::FIELD, &fa, 5000)) {
       Serial.print("+FIELD hash=");
       Serial.print(field::hash(rtcField), HEX);
@@ -615,6 +674,7 @@ void setup() {
   Serial.println(rtcBoots);
 
   // 不在分を30秒刻みで適用。関係も冷ます。昼夜を跨いだら遷移イベント。
+  uint32_t ev0 = gEventSeq; Action act0 = rtcCre.action;  // 描画要否判定用スナップ
   bool nightBefore = creatureNight(rtcCre.age_sec);
   uint32_t steps = absence / 30;
   if (steps > CATCHUP_MAX_STEPS) steps = CATCHUP_MAX_STEPS;
@@ -628,9 +688,11 @@ void setup() {
     const char* ev = actionEvent(na);
     if (ev[0]) setEvent(ev);
   }
+  bool justReborn = false;
   if (rtcCre.health == 0) {  // 不在中の死もここで世代交代
     Serial.println("+DEAD");
     doRebirth(findMateGenes());
+    justReborn = true;  // 新個体は残像なしのfullで迎える
   }
   if (!fresh && strcmp(power::wakeName(), "button") == 0) {
     setEvent(ui::feed(rtcCre));
@@ -646,7 +708,11 @@ void setup() {
     screen::splash(rtcCre);
     delay(2500);
   }
-  if (gDispOk) stayDraw(fresh);
+  // sleep復帰路の間引き: 初回・4周回毎・状態変化時のみ転送 (loop路と同一cadence)。
+  // fullは初回・転生・16周回毎 (約8分毎の残像清掃。stay-awake路はstayDraw内の転送周期で担う)
+  bool acted = fresh || (gEventSeq != ev0) || (rtcCre.action != act0);
+  bool fullNow = fresh || justReborn || (rtcBoots % 16 == 0);
+  if (gDispOk && (acted || rtcBoots % 4 == 0)) stayDraw(fullNow);
   logLife();
 
   // 就寝前の短窓: 通常1.5秒 (ボタン受付)
@@ -780,10 +846,13 @@ void loop() {
         char* e = p + strlen(p);
         while (e > p && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
       if (strncmp(p, "TIME ", 5) == 0) {
-        long u = atol(p + 5);
-        if (u > 1000000000L) {
+        char* ep = nullptr;
+        unsigned long u = strtoul(p + 5, &ep, 10);
+        if (ep != p + 5 && *ep == 0 && u > 1000000000UL && u <= 4294967295UL) {
           rtcUnix = (uint32_t)u;
           Serial.println("+TIME ok");
+        } else {
+          Serial.println("+TIME ng");
         }
       } else if (strcmp(p, "STARVE") == 0) {
         rtcCre.hunger = 100;
@@ -807,7 +876,7 @@ void loop() {
         for (int i = 0; i < 20; i++) screen::sprite(rtcCre, creatureMood(rtcCre), 4, 16);
         Serial.print("+BENCH sprite20us=");
         Serial.println((unsigned long)(micros() - bt0));
-        stayDraw(false);  // バッファ復旧＋表示確認
+        stayDraw(false, true);  // バッファ復旧＋表示確認 (診断のためskip無効)
       } else if (strncmp(p, "INJECT ", 7) == 0) {
         // 疑似受信: 16進パケットをparsePacket→react/learnへ。無線路と同一判定。
         uint8_t b[32];
@@ -837,8 +906,9 @@ void loop() {
         rtcCre.hunger = 100;
         Serial.println("+KILL ok");
       } else if (strncmp(p, "AGE ", 4) == 0) {
-        long a = atol(p + 4);
-        if (a >= 0 && a <= 500000) {
+        char* ep = nullptr;
+        long a = strtol(p + 4, &ep, 10);
+        if (ep != p + 4 && *ep == 0 && a >= 0 && a <= 500000) {
           rtcCre.age_sec = (uint32_t)a;
           Serial.println("+AGE ok");
         } else {
@@ -863,6 +933,21 @@ void loop() {
         setEvent(ui::train(rtcCre, target));
         stayDraw(false);
         Serial.println("+TRAIN ok");
+      } else if (strncmp(p, "TOURNEY ", 8) == 0) {
+        // PCトーナメント終了時の疲労フィードバック (TOURNEY <energy_loss> <hunger_gain> <win:0|1>)
+        // 不正・負値・範囲外は破棄 (旧sscanf無検査はuint8_tラップでvitals破壊)。
+        int el = 0, hg = 0, win = 0;
+        if (sscanf(p + 8, "%d %d %d", &el, &hg, &win) == 3 &&
+            el >= 0 && el <= 100 && hg >= 0 && hg <= 100 && (win == 0 || win == 1)) {
+          rtcCre.energy = (uint8_t)max(0, (int)rtcCre.energy - el);
+          rtcCre.hunger = (uint8_t)min(100, (int)rtcCre.hunger + hg);
+          if (win) rtcCre.happiness = (uint8_t)min(100, (int)rtcCre.happiness + 10);
+          setEvent("FATIGUE");  // 既存の疲労演出・低エネルギーSLEEPY遷移を流用
+          stayDraw(false);
+          Serial.println(win ? "+TOURNEY ack win" : "+TOURNEY ack lose");
+        } else {
+          Serial.println("+TOURNEY ng");
+        }
       } else if (strcmp(p, "FZ") == 0) {
         // 融合遺伝子照会 (PC連れ回し用)。+FZ a,b,c,d (255=空き)
         Serial.print("+FZ ");
@@ -874,6 +959,10 @@ void loop() {
         // 種番号照会 (PC連れ回し用)。+SP 123
         Serial.print("+SP ");
         Serial.println(rtcCre.species_id);
+      } else if (strcmp(p, "ID") == 0) {
+        // 個体ID照会 (PCのID表示同期用)。+ID <HEX8>
+        Serial.print("+ID ");
+        Serial.println(rtcCre.device_id, HEX);
       } else if (strcmp(p, "AFF") == 0) {
         // 好感度・飽きのぞき見 (M10試験用)。+AFF n / +AFF did aff / +AFF habit
         Serial.print("+AFF n=");
@@ -883,18 +972,33 @@ void loop() {
           Serial.print(rtcPeers[i].did, HEX);
           Serial.print(" aff=");
           Serial.print(rtcPeers[i].aff);
-          Serial.println(rtcPeers[i].hasSpecies ? " known" : " strange");
+          Serial.print(rtcPeers[i].hasSpecies ? " known" : " strange");
+          // P0: 知人fuse可視化 (v3既知のみ。旧FW相手は fz=-)。行末追加のため旧パーサ互換
+          if (rtcPeers[i].hasFz) {
+            Serial.print(" fz=");
+            Serial.print(rtcPeers[i].fz[0]); Serial.print(",");
+            Serial.print(rtcPeers[i].fz[1]); Serial.print(",");
+            Serial.print(rtcPeers[i].fz[2]); Serial.print(",");
+            Serial.print(rtcPeers[i].fz[3]);
+            Serial.println();
+          } else {
+            Serial.println(" fz=-");
+          }
         }
         Serial.print("+AFF habit=");
         Serial.print(rtcCre.habit[0]); Serial.print(",");
         Serial.print(rtcCre.habit[1]); Serial.print(",");
         Serial.println(rtcCre.habit[2]);
       } else if (strcmp(p, "PX") == 0) {
-        // 更新監査: 内容hash＋描画回数＋失速数＋最終描画からの経過ms
+        // 更新監査: 内容hash＋描画/省略/full回数＋失速数＋最終描画からの経過ms
         Serial.print("+PX hash=");
         Serial.print(stateHash(), HEX);
         Serial.print(" draws=");
         Serial.print(gDrawCount);
+        Serial.print(" skips=");
+        Serial.print(gSkipCount);
+        Serial.print(" fulls=");
+        Serial.print(gFullCount);
         Serial.print(" stalls=");
         Serial.print(gStallCount);
         Serial.print(" ago=");
@@ -939,7 +1043,8 @@ void loop() {
       setEvent(creatureNight(rtcCre.age_sec) ? "NIGHTFALL" : "DAYBREAK");
     {
       // 現象進行はcore0 (数msのはず。詰まったら諦めて次へ)
-      jobs::FieldArg fa{&rtcField, 4};
+      // faはstatic必須 (タイムアウト後にcore0が触るためスタック禁止)。
+      static jobs::FieldArg fa{&rtcField, 4};
       jobs::run(jobs::FIELD, &fa, 5000);
     }
     bool reborn = false;
@@ -959,7 +1064,13 @@ void loop() {
       }
     }
     logLife();
-    if (millis() - gLastDrawMs > 2000) stayDraw(false);  // 直後に描いたばかりなら重複抑制
+    gTicksSinceDraw++;
+    // 通常tickはROUTINE_DRAW_TICKS毎 (約2分毎) のみ転送。行動・気分・イベント変化は即時。
+    bool urgent = (rtcCre.action != gDrawnAction) ||
+                  (creatureMood(rtcCre) != gDrawnMood) ||
+                  (gEventSeq != gDrawnEventSeq);
+    if ((millis() - gLastDrawMs > 2000) &&  // 直後に描いたばかりなら重複抑制
+        (urgent || gTicksSinceDraw >= ROUTINE_DRAW_TICKS)) stayDraw(false);
     rtcBoots++;
     if (rtcBoots % 8 == 0) {  // 約4分に1回保存
       Serial.print("+SAVED ");

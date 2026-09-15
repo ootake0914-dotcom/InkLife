@@ -8,8 +8,12 @@ InkLife シリアルプロトコル解析 & 状態モデル
 import re
 from typing import Dict, List, Optional, Any, Tuple
 
-# 形態マップ (species % 12 -> 5基本形態 mid)
-MORPH_5_MAP = [0, 1, 2, 1, 4, 2, 7, 7, 0, 1, 2, 0]
+# 形態マップ
+# FW screen.h 準拠:
+# - MORPH_5_MAP は旧定義 (現在FWでは未使用)。互換のため残すが使用禁止。
+# - ANCHOR_BASE_MAP が装備アンカー & fuse優劣の正規マップ (実機正)。
+MORPH_5_MAP = [0, 1, 2, 1, 4, 2, 7, 7, 0, 1, 2, 0]  # LEGACY: FWでは未使用
+ANCHOR_BASE_MAP = [0, 1, 2, 1, 4, 2, 1, 7, 0, 4, 10, 0]  # FW ANCHOR_BASE_MAP そのまま
 MORPH_NAMES = {0: "SLIME", 1: "DRAGON", 2: "SHIBA", 3: "SPINE", 4: "CAT", 5: "HALO", 6: "FIN", 7: "FROG", 8: "SPIRAL", 9: "LEG", 10: "WHISKER", 11: "STAR"}
 GEAR_NAMES = [
     "まる", "つの", "みみ", "とげ", "しま", "わっか",
@@ -35,6 +39,13 @@ MORPH_TRAIT_APTITUDE = [
     (0, 2),  # 10: ひげ (狐)        -> INT, CURIO
     (3, 2),  # 11: ほし (サンショウ)-> SOC, CURIO
 ]
+
+def hab_gain(base: int, exposure: int) -> int:
+    """FW creature.h habGain と同一式 (PC楽観更新の同期用)。"""
+    m = 100 - exposure
+    if m < 20:
+        m = 20
+    return (base * m + 50) // 100
 
 def stat_rank(val: int) -> str:
     """MF2風の能力値ランク (E..S)"""
@@ -68,10 +79,50 @@ def zone_of(gear_id: int) -> int:
     return 3      # AURA (0, 5, 11)
 
 def base_morph_of(species_id: int) -> int:
-    return MORPH_5_MAP[species_id % 12]
+    # FW screen.h sprite() と同一: ANCHOR_BASE_MAP[raw] を使う
+    return ANCHOR_BASE_MAP[species_id % 12]
+
+# 睡眠時HEAD追従オフセット (dx, dy)。FW screen.h SLEEP_HEAD_OFF と1:1同期。
+# 睡眠絵では頭が動くため、HEAD装備のアンカーに加算する。mid順 {0,1,2,4,7,10}。
+SLEEP_HEAD_MIDS = (0, 1, 2, 4, 7, 10)
+SLEEP_HEAD_OFF = [(0, 10), (-4, 10), (0, 5), (-6, 16), (0, 14), (-2, 5)]
+
+def sleep_head_off(mid: int):
+    """睡眠時HEADオフセット (dx, dy)。HEAD帯以外・未知midは (0, 0)"""
+    try:
+        return SLEEP_HEAD_OFF[SLEEP_HEAD_MIDS.index(mid)]
+    except ValueError:
+        return (0, 0)
+
+def normalize_action(action: str) -> str:
+    """FWのシリアル表記 (STANDBY/FEED/UPLINK/...) をPC内部名に正規化。
+    E-Ink表示は生文字列のままが実機正だが、アート解決・AI判定は正規化後を使う。
+    """
+    a = (action or "").upper()
+    if a == "STANDBY":
+        return "IDLE"
+    if a == "FEED":
+        return "EAT"
+    if a == "UPLINK":
+        return "COMM"
+    if a == "SURVEY":
+        return "EXPLORE"
+    if a == "FORAGE":
+        return "SEEK"
+    if a == "EVADE":
+        return "FLEE"
+    if a == "COMBAT":
+        return "FIGHT"
+    return a
+
+# FW trait名 (INT/AGGR/CURIO/SOC) -> PC表示名 (INT/POW/SPD/SKI)
+FW_STAT_TO_DISPLAY = {"INT": "INT", "AGGR": "POW", "CURIO": "SPD", "SOC": "SKI"}
+DISPLAY_TO_FW_STAT = {"INT": "INT", "POW": "AGGR", "SPD": "CURIO", "SKI": "SOC"}
 
 def fuse_shown_gears(fuse_list: List[int], mid: int, raw: Optional[int] = None) -> List[int]:
-    """同部位優劣・自前スキップ・重複スキップを適用して実際に有効なパーツID一覧を返す"""
+    """実際に有効なパーツID一覧をFW描画順 (奥→手前: AURA→BACK→BELLY→HEAD) で返す。
+    適用則 (FW screen.hと同一): 同部位優劣・自前スキップ・重複スキップ、
+    頭頂競合 (ハローは王冠・角と重なるため両者表示時は譲る。遺伝子は保持)"""
     shown = []
     won_mask = 0
     for f in fuse_list[:4]:
@@ -84,6 +135,9 @@ def fuse_shown_gears(fuse_list: List[int], mid: int, raw: Optional[int] = None) 
             continue
         won_mask |= (1 << z)
         shown.append(f)
+    if 5 in shown and (7 in shown or 1 in shown):
+        shown.remove(5)  # ハロー譲歩
+    shown.sort(key=lambda g: (3, 1, 2, 0).index(zone_of(g)))
     return shown
 
 # イベント発生時のセリフ集 (Raylib 標準フォントで化けない ASCII 英語表記)
@@ -216,6 +270,7 @@ class InkProtocolParser:
     RE_BORN = re.compile(r"^\+BORN gen=(\d+) mate=(\w+) tr=([\d,]+) sp=(\d+) fz=([\d,]+)")
     RE_FZ = re.compile(r"^\+FZ (\d+),(\d+),(\d+),(\d+)")
     RE_SP = re.compile(r"^\+SP (\d+)$")
+    RE_ID = re.compile(r"^\+ID ([0-9A-Fa-f]+)$")
     RE_FIELDB = re.compile(r"^\+FIELDB (\d+) ([0-9a-fA-F]{24})$")
     RE_AFF_N = re.compile(r"^\+AFF n=(\d+)")
     RE_AFF_PEER = re.compile(r"^\+AFF ([0-9A-Fa-f]+) aff=(-?\d+) (known|strange)")
@@ -250,7 +305,7 @@ class InkProtocolParser:
             self.state.update_mood()
             return {"type": "life"}
 
-        # +TRAIN
+        # +TRAIN (FWは res/stat/gain に加え hp/en/ha を付与する。即時反映しないと30秒ズレる)
         m = self.RE_TRAIN.match(line)
         if m:
             res = m.group(1)
@@ -261,7 +316,15 @@ class InkProtocolParser:
                 elif stat == "AGGR": self.state.aggression = min(100, self.state.aggression + gain)
                 elif stat == "CURIO": self.state.curiosity = min(100, self.state.curiosity + gain)
                 elif stat == "SOC": self.state.sociability = min(100, self.state.sociability + gain)
-            return {"type": "train", "res": res, "stat": stat, "gain": gain}
+            # FW付随値の即時反映 (欠落時は無視)
+            if m.group(4):
+                self.state.health = max(1, min(100, int(m.group(4))))
+            if m.group(5):
+                self.state.energy = max(0, min(100, int(m.group(5))))
+            if m.group(6):
+                self.state.happiness = max(0, min(100, int(m.group(6))))
+            disp_stat = FW_STAT_TO_DISPLAY.get(stat, stat) if stat else stat
+            return {"type": "train", "res": res, "stat": disp_stat, "fw_stat": stat, "gain": gain}
 
         # +EVT
         m = self.RE_EVT.match(line)
@@ -273,10 +336,19 @@ class InkProtocolParser:
                 self.state.speech_timer = 4.0
             return {"type": "event", "event": evt}
 
-        # +BORN
+        # +BORN (形質trも即時反映。+LIFE待ちだと30秒スライム/旧能力のまま)
         m = self.RE_BORN.match(line)
         if m:
             self.state.generation = int(m.group(1))
+            try:
+                tr_vals = [int(x) for x in m.group(3).split(",")]
+                if len(tr_vals) >= 4:
+                    self.state.intelligence = max(0, min(100, tr_vals[0]))
+                    self.state.curiosity = max(0, min(100, tr_vals[1]))
+                    self.state.aggression = max(0, min(100, tr_vals[2]))
+                    self.state.sociability = max(0, min(100, tr_vals[3]))
+            except ValueError:
+                pass
             self.state.species_id = int(m.group(4))
             fz = [int(x) for x in m.group(5).split(",")]
             self.state.fuse = (fz + [255] * 4)[:4]
@@ -296,6 +368,15 @@ class InkProtocolParser:
         if m:
             self.state.species_id = int(m.group(1))
             return {"type": "species"}
+
+        # +ID (個体ID HEX8。E-InkのID行同期用)
+        m = self.RE_ID.match(line)
+        if m:
+            try:
+                self.state.device_id = int(m.group(1), 16) & 0xFFFFFFFF
+            except ValueError:
+                pass
+            return {"type": "device_id"}
 
         # +FIELDB <row> <24hex> (2bit/cell packing。FWのFIELDBと対応)
         m = self.RE_FIELDB.match(line)
