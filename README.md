@@ -33,6 +33,40 @@ All 12 distinct forms feature dedicated 1-bit pixel art across 5 core emotional 
 
 ---
 
+## Lifecycle & Care-Based Evolution (Egg → Larva → Adult → Elder)
+
+InkLife creatures experience dynamic generational growth driven by care history, real-time internal clock, and evolutionary pressure:
+
+```mermaid
+flowchart LR
+    EGG["🥚 EGG Stage<br/>(0 ~ 5 min)<br/>Crack & Hatch"] --> LARVA["🐛 LARVA Stage<br/>(5 ~ 30 min)<br/>Nourish & Train"]
+    LARVA -->|"S-Rank Care<br/>(Care Score >= 15)"| S_MORPH["⭐ Elite Morphs<br/>(Tsuno, Mimi, Shima, Oukan)"]
+    LARVA -->|"A-Rank Care<br/>(Care Score >= 5)"| A_MORPH["🌿 Standard Morphs<br/>(Maru, Wakka, Hire, Kitsune)"]
+    LARVA -->|"B-Rank Care<br/>(Care Score < 5)"| B_MORPH["🪨 Neglect / Tough Morphs<br/>(Toge, Kora, Iwa, Sanshou)"]
+    S_MORPH --> ELDER["👑 ELDER Stage (Age >= 12h)<br/>Sparkle Crown Mark"]
+    A_MORPH --> ELDER
+    B_MORPH --> ELDER
+```
+
+* **EGG (0 ~ 5 min)**: Smooth egg (`ink_egg_idle`) develops stress fractures (`ink_egg_crack` at 100s) and hatching eyes (`ink_egg_hatch` at 200s).
+* **LARVA (5 ~ 30 min)**: Independent juvenile stage with 5 emotional expressions (`ink_larva_*`). Grows by +1px every 60s.
+* **Branched Evolution (at 30 min)**: Evaluates cumulative care ledger:
+  $$\text{CareScore} = (\text{GoodCare} \times 2) - (\text{CareMiss} \times 3) - (\text{Overwork} \times 2) - \text{NeglectTicks}$$
+* **ELDER (Age >= 12h)**: Venerable lifeform status adorned with dual sparkle elder halos.
+
+---
+
+## Seasonal Hats & Expressive Overlays
+
+Equip procedural and seasonal 1-bit overlays atop any species with pixel-perfect anchor alignment:
+
+| Crown (`ink_crown`) | Pumpkin Hat (`ink_hat_pumpkin`) | Santa Hat (`ink_hat_santa`) | Kagami Mochi (`ink_hat_mochi`) | Droppings (`ink_poop_1/2`) |
+| :---: | :---: | :---: | :---: | :---: |
+| <img src="assets/ink_crown.jpg" width="90" alt="Crown"/> | <img src="assets/ink_hat_pumpkin.jpg" width="90" alt="Pumpkin Hat"/> | <img src="assets/ink_hat_santa.jpg" width="90" alt="Santa Hat"/> | <img src="assets/ink_hat_mochi.jpg" width="90" alt="Kagami Mochi"/> | <img src="assets/ink_poop_1.jpg" width="90" alt="Poop"/> |
+| Tournament / Honor | Halloween Jack-o'-Lantern | Christmas Santa Trimming | New Year Double Mochi | Real-Time Excretion |
+
+---
+
 ## System Architecture
 
 The firmware utilizes an asymmetric FreeRTOS dual-core pipeline on the ESP32-S3, isolating heavy background cellular simulations and radio entropy generation from deterministic UI rendering and state-machine transitions:
@@ -166,7 +200,7 @@ Overwork inflicts severe health penalties, accumulates lifetime fatigue (`overwo
 | **BOOT Button** | Short Click (< 0.5s) | **FEED** | Nourish creature (restores hunger, slight happiness boost) |
 | **BOOT Button** | Long Press (> 1.2s) | **SHARE FOOD** | Broadcast emergency food nutrient packet over LoRa |
 | **SIDE Button** | Short Click (< 0.5s) | **PLAY** | Interactive play (boosts happiness, consumes energy) |
-| **SIDE Button** | Long Press (> 1.2s) | **INSPECT** | Reaction test minigame (manual training, skill-based gains) |
+| **SIDE Button** | Long Press (> 1.2s) | **TRAIN** | MF2-style dice training (morph-aptitude target, same economy as the PC TRAIN command) |
 | **BOOT + SIDE** | Simultaneous Press | **CLEAN** | Clean droppings (restores cleanliness, small happiness boost) |
 
 ### Serial Command Interface (115200 bps)
@@ -212,8 +246,11 @@ run.bat   # Windows one-click launcher (or: uv run companion.py)
 
 * **3D Voxel Terrarium**: Real-time rendering of your creature with dynamic lighting, animations, and rotating Brian's Brain CA hologram.
 * **Virtual E-Ink Mirror**: Pixel-perfect 296x128 monochrome display emulation updated in real-time with physical device state.
+* **8-Bit Retro Audio Engine**: 36 procedural chiptune sound effects covering all physical and social interactions (feed, play, sleep, wake, bond, combat, evolution, tournament fanfare).
+* **8-Player Tournament Arena**: Single-elimination competitive bracket with automatic AI progression, live damage calculations, and crown awards.
+* **Morph Encyclopedia (M-Key)**: In-app dex detailing all 12 species, innate aptitude tiers, and care evolution branching rules.
 * **Social Radar**: Visualizes nearby discovered LoRa creatures, distances, and affinity statuses (`NEUTRAL`, `BONDED`, `RIVAL`).
-* **Telemetry & Care Deck**: Interactive control terminal (`FEED`, `PLAY`, `TRAIN`, `TIME SYNC`, `SNAPSHOT`).
+* **Telemetry & Care Deck**: Interactive control terminal (`FEED`, `PLAY`, `TRAIN`, `PET`, `TIME SYNC`, `SNAPSHOT`).
 
 ---
 

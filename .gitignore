@@ -22,3 +22,10 @@ repomix-output.xml
 *.tmp
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# IDE & Editor configurations
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace

@@ -255,81 +255,11 @@ void careClean() {
   setEvent(r);
 }
 
-// 反応速度検査 (SIDE長押し・手動訓練)。E-Inkは遅すぎて合図にならないため、
-// カウントダウンとGOはLED+シリアルで出す (画面は開始と結果のみ)。
-// 経済はTRAINダイスと同一 (コスト15en/12hu/5ha・過労ゲート・利得表)。腕の分だけ伸びる。
-void runInspectGame() {
-  static const char* TNAMES[] = {"INT", "AGGR", "CURIO", "SOC"};
-  if (rtcCre.energy < 15) {  // 過労ゲート (TRAINと同一)
-    rtcCre.health = (rtcCre.health > 5) ? rtcCre.health - 5 : 1;
-    rtcCre.happiness = (rtcCre.happiness > 10) ? rtcCre.happiness - 10 : 0;
-    rtcCre.action = Action::IDLE;
-    if (rtcOverwork < 9999) rtcOverwork++;
-    setEvent("OVERWORK");
-    stayDraw(false);
-    gStayTick = millis();
-    return;
-  }
-  rtcCre.energy = (rtcCre.energy >= 15) ? rtcCre.energy - 15 : 0;
-  rtcCre.hunger = min(100, (int)rtcCre.hunger + 12);
-  rtcCre.happiness = (rtcCre.happiness >= 5) ? rtcCre.happiness - 5 : 0;
-  uint8_t target = ui::pickTrainTarget(rtcCre);
-  // 離し待ち (長押しの指が残っていても誤爆しない)。ボタン固着時は3秒で打ち切る:
-  // 以降の進行はBOOTのみ参照 (GO判定・お手つき) のためSIDE保持のままでも必ず終局し、
-  // FWが待ちループで永久に固まる事故を防ぐ (テレメトリ停止・PCから復旧不能になる)
-  for (unsigned long rw = millis(); halLevel() && millis() - rw < 3000;) {
-    esp_task_wdt_reset();
-    delay(10);
-  }
-  setEvent("TEST_START");
-  stayDraw(false);
-  // カウントダウン3拍＋ランダム間隔。GO前のBOOT押下はお手つきとして記録する。
-  unsigned long c0 = millis();
-  uint32_t waitMs = 1800 + esp_random() % 1000;  // 数え合図防止
-  uint8_t lastCount = 4;
-  bool flying = false;
-  while (millis() - c0 < waitMs) {
-    esp_task_wdt_reset();
-    unsigned long el = millis() - c0;
-    if (el < 1800) {
-      uint8_t count = (uint8_t)(3 - el / 600);  // 3,2,1
-      if (count != lastCount) {
-        lastCount = count;
-        led::blip();
-        Serial.print("+TEST ");
-        Serial.println(count);
-      }
-    }
-    if (halButtons() & 1) flying = true;
-    delay(10);
-  }
-  led::blip();
-  unsigned long t0 = millis();
-  Serial.println("+TEST GO!!");
-  // 応答窓2秒。BOOTのみ有効 (10msポーリングで±150ms判定に足る)。
-  bool pressed = false;
-  long dt = 0;
-  while (millis() - t0 < 2000) {
-    esp_task_wdt_reset();
-    if (halButtons() & 1) { pressed = true; dt = (long)(millis() - t0); break; }
-    delay(5);
-  }
-  uint8_t grade = flying ? 4 : ui::gradeInspect((int)dt, pressed);
-  const char* ev = ui::applyInspect(rtcCre, target, grade);
-  if (grade <= 2 && rtcCareGood < 9999) rtcCareGood++;
-  Serial.print("+INSPECT target=");
-  Serial.print(TNAMES[target]);
-  Serial.print(" grade=");
-  Serial.print(grade);
-  Serial.print(" dt=");
-  Serial.println(pressed ? dt : -1);
-  setEvent(ev);
-  if (grade == 0) {  // 王冠ファンファーレ (小物はパーシャルだと薄いのでfullで描く)
-    led::blip(); delay(120); led::blip(); delay(120); led::blip();
-  }
-  stayDraw(grade == 0);
-  gStayTick = millis();
-}
+// トレーニング (SIDE長押し・手動訓練) はMF2式ダイス = ui::train。
+// 旧: 反応速度検査ゲームを実機で動かしていたが、E-Inkが遅く合図(LED/時間窓)が伝わらないため
+// 確率に戻した。反応ゲームはPC側 (Gキー→INSPECTコマンド) が担当し、そちらは画面で合図できる。
+// ダイスの経済は careTrain 経由でTRAINコマンドと完全に同一 (コスト/過労ゲート/利得表)。
+
 // 飢餓放置の計上。30秒tick毎に呼ぶ (不在catch-up内も1step1回)。
 inline void countNeglectTick() {
   if (rtcCre.hunger >= 95 && rtcCareMiss < 9999) rtcCareMiss++;
@@ -877,8 +807,8 @@ void setup() {
 
   // タスクWDT武装: loopタスクが20秒以上戻らない場合に自動再起動する。
   // 無限ループ/固着で「テレメトリもPC復旧も不能」になる事故の最後の砦 (実機で発生済み)。
-  // 20秒はE-Inkフル描画8秒＋検査ゲーム最長16秒を含めても余裕がある値。
-  // 検査ゲーム等の長い待ちループは明示的にesp_task_wdt_reset()で餌をやること。
+  // 20秒はE-Inkフル描画8秒を含めても余裕がある値。
+  // 長い待ちループを足す場合は明示的にesp_task_wdt_reset()で餌をやること。
   // 電池運用 (gStayAwake=false) では武装しない: deep sleep中はWDTが止まり誤爆リスクがあるため。
   if (gStayAwake) {
     esp_task_wdt_config_t wcfg = {};
@@ -1028,7 +958,8 @@ void loop() {
         sideFired = false;
       } else if (!sideFired && (halLevel() & 3) != 3 && millis() - sidePressStart > 1200) {
         sideFired = true;
-        runInspectGame();  // SIDE長押し＝反応速度検査 (手動訓練。ダイス自動はTRAINコマンド側)
+        careTrain(-1);      // SIDE長押し＝トレーニング (MF2式ダイス。形態適性から自動選択)
+        stayDraw(false);
       }
     } else {
       sidePressStart = 0;

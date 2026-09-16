@@ -68,18 +68,9 @@ inline uint8_t pickTrainTarget(const Creature& c) {
   return ((esp_random() % 100) < 70) ? MORPH_TRAIT_APTITUDE[raw][0] : MORPH_TRAIT_APTITUDE[raw][1];
 }
 
-// 反応検査の等級: 0=PERFECT 1=GREAT 2=GOOD 3=FAIL 4=FLYING(お手つき)
-inline uint8_t gradeInspect(int dtMs, bool pressed) {
-  if (!pressed) return 3;
-  if (dtMs < 0) return 4;
-  if (dtMs <= 150) return 0;
-  if (dtMs <= 400) return 1;
-  if (dtMs <= 800) return 2;
-  return 3;
-}
-
 // 検査結果の適用 (TRAINと同一利得表。コスト支払い・過労ゲートは呼出側)。
 // PERFECTはGREAT上限値+王冠 (表示は呼出側がイベント名"TR:PERFECT!"で判定)。
+// 呼出元: シリアルINSPECT (PC側Gキーの反応ゲーム)。実機はダイスtrainを使う。
 inline const char* applyInspect(Creature& c, uint8_t target, uint8_t grade) {
   if (target > 3) target = 0;
   if (grade == 4) {  // お手つきは失格 (やる気も少し削る)
