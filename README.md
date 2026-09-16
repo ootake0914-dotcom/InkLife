@@ -10,6 +10,10 @@
 
 Featuring an asymmetric dual-core architecture, a strict 48-byte packed genetic memory model, an ambient cellular automaton ("Phenomenon Field"), and a *Monster Farm 2*-inspired training engine with exhaustion mechanics.
 
+<p align="center">
+  <img src="docs/pc_companion_station.png" width="850" alt="InkLife 3D Companion Station & Virtual E-Ink Mirror"/>
+</p>
+
 ---
 
 ## Visual Showcase — 12 Distinct Species
@@ -238,6 +242,15 @@ REBORN                    # Trigger generational succession
 ## PC 3D Companion Station
 
 The companion station (`pc-companion/companion.py`) provides an interactive 3D observation terrarium powered by **Raylib**:
+
+<p align="center">
+  <img src="docs/pc_companion_station.png" width="800" alt="PC 3D Companion Station Screen"/>
+</p>
+
+### Real-Time 2.9" Virtual E-Ink Display Mirror (296x128)
+<p align="center">
+  <img src="docs/virtual_eink_mirror.png" width="550" alt="Virtual E-Ink Display Mirror"/>
+</p>
 
 ```bash
 cd pc-companion

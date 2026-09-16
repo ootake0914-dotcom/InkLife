@@ -609,6 +609,34 @@ def main():
     state.last_event = "WAKE_OK"
     state.speech_bubble = "InkLife 3D Online! Welcome back!"
 
+    screenshot_mode = "--screenshot" in sys.argv
+    frame_count = 0
+    if screenshot_mode:
+        from inkparser import PeerInfo
+        state.has_life = True
+        state.age_sec = 3600 * 3 + 1500  # 3時間25分 (成体)
+        state.health = 98
+        state.hunger = 20
+        state.energy = 88
+        state.happiness = 95
+        state.cleanliness = 100
+        state.intelligence = 74
+        state.aggression = 88
+        state.curiosity = 65
+        state.sociability = 92
+        state.action = "STANDBY"
+        state.mood = "HAPPY"
+        state.speech_bubble = "InkLife 3D Online! Ready to train!"
+        state.speech_timer = 10.0
+        state.peers["0x1234"] = PeerInfo("0x1234", aff=48, known=True, species=1, rssi=-62)
+        state.peers["0x8765"] = PeerInfo("0x8765", aff=-32, known=True, species=4, rssi=-78)
+        serial_worker._add_log("+LIFE: Gen=24 H=98 E=88 M=HAPPY")
+        serial_worker._add_log("+EVT: LORA_RX [0x1234] RSSI=-62 BONDED")
+        serial_worker._add_log("+EVT: BRAIN_CA Act=142 Sym=8")
+        serial_worker._add_log("+EVT: HAB_SYNC Food=40 Play=65 Soc=80")
+        serial_worker._add_log("> TIME 1726500000")
+        serial_worker._add_log("+EVT: TIME_SYNC OK")
+
     # 3. 3D カメラ設定 (Orbit カメラ)
     cam = rl.Camera3D()
     cam.position = rl.Vector3(0.0, 1.8, 3.8)
@@ -1443,6 +1471,24 @@ void main() {
             draw_morph_dex(state)
 
         rl.end_drawing()
+
+        if screenshot_mode:
+            frame_count += 1
+            if frame_count == 60:
+                os.makedirs("docs", exist_ok=True)
+                snap_station = "docs/pc_companion_station.png"
+                rl.take_screenshot(snap_station)
+            elif frame_count >= 65:
+                snap_station = "docs/pc_companion_station.png"
+                if os.path.exists(snap_station):
+                    img_all = rl.load_image(snap_station)
+                    # 仮想E-Inkミラーの切り抜き (eink_x=668, eink_y=20, w=592, h=256, ベゼルpad=8)
+                    crop_rec = rl.Rectangle(668 - 8, 20 - 8, 592 + 16, 256 + 16)
+                    rl.image_crop(img_all, crop_rec)
+                    rl.export_image(img_all, "docs/virtual_eink_mirror.png")
+                    rl.unload_image(img_all)
+                    print(f"[Screenshot] Generated {snap_station} & docs/virtual_eink_mirror.png")
+                break
 
     # 5. 終了処理
     serial_worker.running = False
