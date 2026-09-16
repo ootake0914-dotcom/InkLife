@@ -225,17 +225,17 @@ REBORN                    # Trigger generational succession
 ```
 
 > [!WARNING]
-> **【重要】シリアル通信の詰まり・動作遅延に関する注意点 (Serial Congestion & Blocking Prevention)**
-> ESP32-S3 のハードウェア USB-CDC（仮想COMポート）では、シリアル送受信バッファの滞留によってファームウェアのメインループ（E-Ink描画や生物シミュレーション）がブロッキングし、ボードの動作が極端に重くなる（フリーズする）現象が発生します。以下の設計原則を厳守してください：
+> **CRITICAL: Serial Congestion & Blocking Prevention (シリアル通信の詰まり・動作遅延に関する注意点)**
+> On the ESP32-S3 hardware USB-CDC (Virtual COM Port), buffer saturation in serial transmit/receive queues can cause the firmware's main loop (E-Ink rendering and biological simulation) to block, leading to extreme latency or complete system freezing. Adhere strictly to the following architectural principles:
 > 
-> 1. **ホスト未接続・読み出し停止時の送信ブロッキング防止**:
->    - PC側でシリアルポートを開いていない場合や読み出しが滞った場合、送信バッファ（TX FIFO）が満杯になると `Serial.print()` / `Serial.println()` が内部で完了待ちブロッキングを起こします。
->    - 送信時は `Serial.availableForWrite()` で空き容量を確認するか、バッファフル時はパケットをスキップ（ドロップ）する安全制御を実装してください。
-> 2. **受信処理の完全非ブロッキング化**:
->    - `Serial.readStringUntil('\n')` などのブロッキングAPIは使用禁止です。改行コードが欠落した場合にタイムアウトまでメインループ全体が停止します。
->    - `Serial.available()` を確認し、1バイトずつリングバッファ／行バッファへ蓄積する非ブロッキング受信を行ってください。
-> 3. **PCコンパニオン側での高頻度連投の抑制**:
->    - ホストPC側（`companion.py` 等）から高頻度にコマンドを連投するとマイコン側受信バッファが溢れ、パケット破損や処理詰まりの原因になります。コマンド送信には適切なインターバル（スロットリング）を設けてください。
+> 1. **Prevent TX Blocking When Host is Disconnected or Reading is Stalled (送信ブロッキング防止)**:
+>    - If the host PC has not opened the serial port or stalls reading incoming data, the TX FIFO buffer fills up, causing internal `Serial.print()` / `Serial.println()` calls to block waiting for available buffer space.
+>    - Always check `Serial.availableForWrite()` before writing, or implement defensive telemetry dropping when buffers are saturated.
+> 2. **Enforce Strictly Non-Blocking Serial Ingestion (受信処理の完全非ブロッキング化)**:
+>    - Never use blocking APIs such as `Serial.readStringUntil('\n')`. If a trailing newline is dropped, the entire main loop freezes until timeout expiration.
+>    - Poll incoming bytes with `Serial.available()` and accumulate them one by one into a non-blocking line/ring buffer.
+> 3. **Throttle Command Emission from Companion Apps (PCコンパニオン側での高頻度連投の抑制)**:
+>    - Companion software (such as `companion.py`) must avoid flooding the MCU with rapid bursts of commands, which overflows the RX FIFO and causes packet corruption. Introduce appropriate command throttling and pacing intervals.
 
 ---
 
