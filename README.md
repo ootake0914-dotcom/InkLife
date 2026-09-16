@@ -6,7 +6,7 @@
 [![Display](https://img.shields.io/badge/Display-2.9%22_E--Ink_296x128-black.svg)]()
 [![Radio](https://img.shields.io/badge/Radio-SX1262_LoRa_923MHz-orange.svg)]()
 
-**InkLife** is a decentralized artificial lifeform living on an ultra-low-power electronic paper habitat. Creatures live calmly on their bistable display, autonomously encounter peer devices over long-range **LoRa mesh networks**, form relationships, trade nutrients, battle, and cross-breed across generations—completely free of Wi-Fi, cloud servers, or smartphone dependencies.
+**InkLife** is a decentralized artificial lifeform living on an ultra-low-power electronic paper habitat, specifically engineered for the **Heltec Vision Master E290** development platform. Creatures live calmly on their bistable display, autonomously encounter peer devices over long-range **LoRa mesh networks**, form relationships, trade nutrients, battle, and cross-breed across generations—completely free of Wi-Fi, cloud servers, or smartphone dependencies.
 
 Featuring an asymmetric dual-core architecture, a strict 48-byte packed genetic memory model, an ambient cellular automaton ("Phenomenon Field"), and a *Monster Farm 2*-inspired training engine with exhaustion mechanics.
 
@@ -188,6 +188,7 @@ Overwork inflicts severe health penalties, accumulates lifetime fatigue (`overwo
 
 | Component | Specification | Pin Assignment / Interface |
 | :--- | :--- | :--- |
+| **Target Board** | **Heltec Vision Master E290** (All-in-One E-Paper + LoRa Development Board) | Dedicated Platform |
 | **MCU** | ESP32-S3R8 (Dual-Core Xtensa LX7 @ 240MHz, 8MB PSRAM, 16MB Flash) | Embedded |
 | **E-Ink Display** | 2.9" Monochrome E-Paper (296x128, SSD1680) | CS: 3, DC: 2, RST: 1, BUSY: 4, SPI |
 | **LoRa Radio** | Semtech SX1262 Sub-GHz Transceiver (923MHz) | NSS: 8, RST: 5, BUSY: 13, DIO1: 14, SPI |
@@ -269,13 +270,15 @@ run.bat   # Windows one-click launcher (or: uv run companion.py)
 
 ## Building & Flashing
 
+Firmware is specifically tailored for the **Heltec Vision Master E290** (ESP32-S3R8 + 2.9" E-Ink + SX1262 LoRa).
+
 ### Prerequisites
 * [arduino-cli](https://arduino.github.io/arduino-cli/) with the `esp32` core installed:
   ```bash
   arduino-cli core install esp32:esp32
   ```
 
-### Build & Flash Firmware
+### Build & Flash Firmware (Target: Heltec Vision Master E290)
 ```bash
 # Compile firmware
 arduino-cli compile -b "esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB" InkLife.ino
