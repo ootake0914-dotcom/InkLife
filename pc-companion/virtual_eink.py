@@ -6,7 +6,9 @@ InkLife バーチャル E-Ink レンダラー (296x128 ピクセル完全再現)
 Raylib テクスチャとして画面上にリアルタイム描画します。
 """
 
+import datetime
 import math
+import time
 from typing import List, Tuple
 import pyray as rl
 from inkparser import CreatureState, base_morph_of, fuse_shown_gears, normalize_action, sleep_head_off, zone_of
@@ -30,15 +32,14 @@ class VirtualEInk:
         rl.unload_image(img)
         self.pixels_rgba = bytearray(EPD_W * EPD_H * 4)
 
-        # ログバッファ (最新2件)
-        self.logs: List[str] = ["SYSTEM READY", "WAITING FOR SYNC..."]
+        # ログバッファ (最新2件)。実機 evLog と同じく初期は空 (イベントで埋まる)
+        self.logs: List[str] = ["", ""]
         self.last_age: int = 0
 
     def push_log(self, text: str, age_sec: int):
         h = min(age_sec // 3600, 99)
         m = (age_sec // 60) % 60
-        s = age_sec % 60
-        line = f">T+{h:02d}:{m:02d}:{s:02d} {text}"
+        line = f">T+{h:02d}:{m:02d} {text}"  # FW分丸めと同一 (秒は間引き描画と矛盾するため)
         self.logs.insert(0, line)
         if len(self.logs) > 2:
             self.logs.pop()
@@ -95,7 +96,7 @@ class VirtualEInk:
         # E-Ink 完全再現のためにピクセル上にラスタライズ
         pass
 
-    def render(self, state: CreatureState):
+    def render(self, state: CreatureState, wall_synced: bool = False):
         """実機 screen.h の draw() ロジックを完全エミュレート"""
         self.clear()
 
@@ -112,7 +113,7 @@ class VirtualEInk:
         self.draw_line(108, 4, 108, 124)
 
         # 96x96 キメラドット絵の描画 (標本窓の中央: x=5, y=16 付近)
-        self._render_creature_art(state)
+        self._render_creature_art(state, wall_synced)
 
         # 右側ステータスバー群 (x=180〜232) + HUDアイコン (x=114)
         tx_bar = 180
@@ -146,11 +147,11 @@ class VirtualEInk:
         # バッファをテクスチャへ転送
         self._update_texture()
 
-    def _render_creature_art(self, state: CreatureState):
+    def _render_creature_art(self, state: CreatureState, wall_synced: bool = False):
         """標本窓内にキメラの 2D ドット絵を描画 (idle12独立、動作5基幹)"""
         raw = state.species_id % 12
         mid = base_morph_of(state.species_id)
-        frame_name = self._resolve_frame_name(raw, mid, state.action, state.mood)
+        frame_name = self._resolve_frame_name(raw, mid, state.action, state.mood, state.age_sec)
         frame_bytes = ART_DB.get_frame_bytes(frame_name)
         if not frame_bytes or len(frame_bytes) < 1152:
             return
@@ -171,8 +172,9 @@ class VirtualEInk:
                     self.draw_pixel(ox + dx, oy + dy, True)
 
         # キメラパーツの追加 (睡眠時はHEAD装備だけ追従オフセット。FW sprite()と同一)
+        # 早期形態 (タマゴ/幼生) は純血固定でパーツなし (FW早期returnと同一)
         asleep = (normalize_action(state.action) == "SLEEP" or state.mood == "SLEEPY")
-        effective_gears = fuse_shown_gears(state.fuse, mid, raw)
+        effective_gears = [] if state.age_sec < 7200 else fuse_shown_gears(state.fuse, mid, raw)
         for gid in effective_gears:
             if gid in (0, 4, 8, 11):
                 # 手続き型
@@ -204,6 +206,100 @@ class VirtualEInk:
                             if (bmp[py * stride + (px >> 3)] >> (px & 7)) & 1:
                                 self.draw_pixel(ox + sx, oy + sy, True)
                     # breakしない: ペア物 (耳L/R・髭L/R) は同gearで2行ある
+
+        # イベント重ねは最前面 (FW sprite()と同一順序: うんち→王冠→帽子)
+        # うんちは白抜きハロー付き (尻尾・装備に埋もれず前景に見せる)
+        if state.cleanliness < 50:
+            if "ink_poop_1" in ART_DB.frames:
+                self.fill_rect(ox + 64 * dst // 96, oy + 71 * dst // 96,
+                               max(1, 20 * dst // 96), max(1, 18 * dst // 96), False)
+                self._draw_overlay_96("ink_poop_1", ox, oy, dst)
+            else:
+                self._draw_poop_96(ox, oy, dst, 78, 84, 6, 5)  # フォールバック旧ドット
+        if state.cleanliness < 25:
+            if "ink_poop_2" in ART_DB.frames:
+                self.fill_rect(ox + 57 * dst // 96, oy + 74 * dst // 96,
+                               max(1, 20 * dst // 96), max(1, 18 * dst // 96), False)
+                self._draw_overlay_96("ink_poop_2", ox, oy, dst)
+            else:
+                self._draw_poop_96(ox, oy, dst, 68, 88, 5, 4)
+        hk = 65 if 600 <= state.age_sec < 7200 else 100  # FW isLarvaStage基準 (卵は100)
+        crown = len(self.logs) > 0 and self.logs[0].endswith("TR:PERFECT!")
+        if crown:
+            self._draw_overlay_96("art_test_crown", ox, oy, dst, hk)
+        elif wall_synced:
+            hat_kind = self._hat_kind_now()
+            if hat_kind == 1:
+                self._draw_overlay_96("ink_hat_pumpkin", ox, oy, dst, hk)
+            elif hat_kind == 2:
+                self._draw_overlay_96("ink_hat_santa", ox, oy, dst, hk)
+            elif hat_kind == 3:
+                self._draw_overlay_96("ink_hat_mochi", ox, oy, dst, hk)
+
+        # 通信アンテナ波紋 (FW sprite(): 専用アクション絵なし時のみ・最前面)
+        act = normalize_action(state.action)
+        no_dedicated = not (act in ("SLEEP", "EAT", "PLAY") or state.mood in ("SLEEPY", "HAPPY", "SAD", "SICK"))
+        if act == "COMM" and no_dedicated:
+            SC = lambda v: (v * dst) // 96
+            for r in (4, 8, 12):
+                self._draw_circle(ox + SC(84), oy + SC(14), max(1, SC(r)))
+
+    def _draw_circle(self, x0: int, y0: int, r: int):
+        """Adafruit_GFX drawCircle と同一アルゴリズム (FW ring()の見た目再現)"""
+        f = 1 - r
+        ddf_x, ddf_y = 1, -2 * r
+        x, y = 0, r
+        self.draw_pixel(x0, y0 + r)
+        self.draw_pixel(x0, y0 - r)
+        self.draw_pixel(x0 + r, y0)
+        self.draw_pixel(x0 - r, y0)
+        while x < y:
+            if f >= 0:
+                y -= 1
+                ddf_y += 2
+                f += ddf_y
+            x += 1
+            ddf_x += 2
+            f += ddf_x
+            self.draw_pixel(x0 + x, y0 + y)
+            self.draw_pixel(x0 - x, y0 + y)
+            self.draw_pixel(x0 + x, y0 - y)
+            self.draw_pixel(x0 - x, y0 - y)
+            self.draw_pixel(x0 + y, y0 + x)
+            self.draw_pixel(x0 - y, y0 + x)
+            self.draw_pixel(x0 + y, y0 - x)
+            self.draw_pixel(x0 - y, y0 - x)
+
+    def _draw_overlay_96(self, frame_name: str, ox: int, oy: int, dst: int, k: int = 100) -> bool:
+        """96空間フルフレーム透過重ね (FW overlay96sと同一)。成功時True"""
+        fb = ART_DB.frames.get(frame_name)
+        if not fb or len(fb) < 1152:
+            return False
+        for y in range(96):
+            row = y * 12
+            for x in range(96):
+                if (fb[row + (x >> 3)] >> (x & 7)) & 1:
+                    sx = 48 + (x - 48) * k // 100
+                    sy = 48 + (y - 48) * k // 100
+                    self.draw_pixel(ox + sx * dst // 96, oy + sy * dst // 96, True)
+        return True
+
+    @staticmethod
+    def _hat_kind_now() -> int:
+        """ホストJSTの季節帽子種類 (FW hatKindJSTと同一): 0=なし 1=かぼちゃ 2=サンタ 3=鏡餅"""
+        jst = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=9)
+        if (jst.month == 10 and jst.day == 31) or (jst.month == 11 and jst.day == 1):
+            return 1
+        if jst.month == 12 and 24 <= jst.day <= 26:
+            return 2
+        if jst.month == 1 and 1 <= jst.day <= 3:
+            return 3
+        return 0
+
+    @staticmethod
+    def _is_halloween_now() -> bool:
+        """ホストJSTで10/31〜11/1か (FW wallHalloweenJSTと同一)。旧API互換のため残置"""
+        return VirtualEInk._hat_kind_now() == 1
 
     def _blit_sheet_gear(self, ox, oy, dst, var, ax, ay):
         """シート型ギア転写 (FW screen.h drawPart と同一。mask白抜き→黒描画)"""
@@ -265,7 +361,27 @@ class VirtualEInk:
                 self.fill_rect(ox + SC(cx - 1), oy + SC(cy - 4), max(1, SC(3)), max(1, SC(9)), True)
             return
 
-    def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str) -> str:
+    def _draw_poop_96(self, ox: int, oy: int, dst: int, x: int, y: int, w: int, h: int):
+        """96空間の矩形を成長サイズに追従して描画 (FW dot()と同一式)"""
+        x0, y0 = ox + x * dst // 96, oy + y * dst // 96
+        ww, hh = max(1, w * dst // 96), max(1, h * dst // 96)
+        for dy in range(hh):
+            for dx in range(ww):
+                self.draw_pixel(x0 + dx, y0 + dy, True)
+
+    def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str, age_sec: int = 999999) -> str:
+        # FW screen.h sprite() と同一: 600s未満=タマゴ3段階、7200s未満=幼生5感情
+        if age_sec < 600:
+            if age_sec < 200: return "ink_egg_idle"
+            if age_sec < 400: return "ink_egg_crack"
+            return "ink_egg_hatch"
+        if age_sec < 7200:
+            act = normalize_action(action)
+            if act == "SLEEP" or mood == "SLEEPY": return "ink_larva_sleep"
+            if act == "EAT": return "ink_larva_eat"
+            if act == "PLAY" or mood == "HAPPY": return "ink_larva_happy"
+            if mood in ("SAD", "SICK"): return "ink_larva_sad"
+            return "ink_larva_idle"
         # 全12形態 (0〜11) が専用アクション絵を完全保持 (FW表記ゆれ対応)
         act = normalize_action(action)
         if act == "SLEEP" or mood == "SLEEPY": return f"ink_m{raw:02d}_sleep"
@@ -299,7 +415,7 @@ class VirtualEInk:
         cdata_pixels = rl.ffi.cast("void *", rl.ffi.from_buffer(self.pixels_rgba))
         rl.update_texture(self.texture, cdata_pixels)
 
-    def draw_on_screen(self, dest_x: int, dest_y: int, scale: float, state: CreatureState):
+    def draw_on_screen(self, dest_x: int, dest_y: int, scale: float, state: CreatureState, wall_synced: bool = False, connected: bool = False):
         """画面上にベゼルフレームと高精細文字付きで描画"""
         dw = int(EPD_W * scale)
         dh = int(EPD_H * scale)
@@ -320,29 +436,52 @@ class VirtualEInk:
         dst_rec = rl.Rectangle(dest_x, dest_y, dw, dh)
         rl.draw_texture_pro(self.texture, src_rec, dst_rec, rl.Vector2(0, 0), 0.0, rl.WHITE)
 
+        # 初回+LIFE待ち (接続直後のデモ値混在を隠す。オフラインはデモ表示)
+        if connected and not state.has_life:
+            rl.draw_rectangle(dest_x, dest_y, dw, dh, rl.Color(238, 240, 235, 220))
+            sync_msg = "SYNCING TELEMETRY..."
+            mw = rl.measure_text(sync_msg, int(12 * scale))
+            rl.draw_text(sync_msg, dest_x + (dw - mw) // 2, dest_y + int(60 * scale),
+                         int(12 * scale), COLOR_INK)
+            return
+
         # HUD テキストを Raylib で鮮明にオーバーレイ描画
         S = scale
         tx = dest_x + int(114 * S)
         fs = int(10 * S)  # フォントサイズ
 
-        hms = f"{min(state.age_sec // 3600, 99):02d}:{(state.age_sec // 60) % 60:02d}:{state.age_sec % 60:02d}"
+        hms = f"{min(state.age_sec // 3600, 99):02d}:{(state.age_sec // 60) % 60:02d}"  # FW分丸めと同一
 
-        # 標本窓ラベル (実機 screen.h:565-566 と同一座標。T+は右上 x=236)
+        # 標本窓ラベル (実機 screen.h:565-566 と同一座標。T+は右上 x=236 左詰め)
         rl.draw_text("SPECIMEN", dest_x + int(6 * S), dest_y + int(4 * S), fs, COLOR_INK)
-        rl.draw_text(f"T+{hms}", dest_x + int(236 * S) - rl.measure_text(f"T+{hms}", fs), dest_y + int(4 * S), fs, COLOR_INK)
-        rl.draw_text(f"G{state.generation:02d} {state.base_name}-{state.species_id%12:02d}",
+        rl.draw_text(f"T+{hms}", dest_x + int(236 * S), dest_y + int(4 * S), fs, COLOR_INK)
+        # FW morphTag() と同一: 早期形態はEGG/LARVA表示
+        if state.age_sec < 600: morph_tag = "EGG"
+        elif state.age_sec < 7200: morph_tag = "LARVA"
+        else: morph_tag = f"{state.base_name}-{state.species_id%12:02d}"
+        rl.draw_text(f"G{state.generation:02d} {morph_tag}",
                      dest_x + int(6 * S), dest_y + int(116 * S), fs, COLOR_INK)
 
         # 右側ステータス
         peers_cnt = len(state.peers)
         p_str = f" P{peers_cnt}" if peers_cnt > 0 else ""
         rl.draw_text(f"ID {state.device_id:08X} G{state.generation:02d}{p_str}", tx, dest_y + int(4 * S), fs, COLOR_INK)
-        rl.draw_text(f"HP  {state.health:03d}", tx, dest_y + int(16 * S), fs, COLOR_INK)
-        rl.draw_text(f"SAT {100 - state.hunger:03d}", tx, dest_y + int(28 * S), fs, COLOR_INK)
-        rl.draw_text(f"EN  {state.energy:03d}", tx, dest_y + int(40 * S), fs, COLOR_INK)
-        rl.draw_text(f"HA  {state.happiness:03d}", tx, dest_y + int(52 * S), fs, COLOR_INK)
-        rl.draw_text(f"ACT {state.action}", tx, dest_y + int(64 * S), fs, COLOR_INK)
-        rl.draw_text(f"FLD {state.field_activity:3d}", dest_x + int(200 * S), dest_y + int(64 * S), fs, COLOR_INK)
+        # HP/SAT/EN/HAはHUDアイコン(tx=114)右のx=132 (FW textEN(tx+18)と同一)
+        tx_st = dest_x + int(132 * S)
+        rl.draw_text(f"HP  {state.health:03d}", tx_st, dest_y + int(16 * S), fs, COLOR_INK)
+        rl.draw_text(f"SAT {100 - state.hunger:03d}", tx_st, dest_y + int(28 * S), fs, COLOR_INK)
+        rl.draw_text(f"EN  {state.energy:03d}", tx_st, dest_y + int(40 * S), fs, COLOR_INK)
+        rl.draw_text(f"HA  {state.happiness:03d}", tx_st, dest_y + int(52 * S), fs, COLOR_INK)
+        # ACTはFW6pxピッチよりPC字幅が広く最長APPROACHでFLD(190)に5px侵入するため、
+        # 190手前を割る場合のみ字間を詰めてFW実寸(末尾186)に寄せる
+        act_str = f"ACT {state.action}"
+        if tx + rl.measure_text(act_str, fs) > dest_x + int(189 * S):
+            rl.draw_text_ex(rl.get_font_default(), act_str, rl.Vector2(tx, dest_y + int(64 * S)),
+                            fs, -1.0, COLOR_INK)
+        else:
+            rl.draw_text(act_str, tx, dest_y + int(64 * S), fs, COLOR_INK)
+        # FLD数値はx190配置 (FW screen.hと同一。Raylib字幅での現象窓240〜への被りを避ける)
+        rl.draw_text(f"FLD {state.field_activity:3d}", dest_x + int(190 * S), dest_y + int(64 * S), fs, COLOR_INK)
 
         # 形質コード + 状態コード (FW traitLabel準拠: 最大形質1項目) + 概日
         m_val, m_code = state.curiosity, "CUR"
@@ -353,7 +492,12 @@ class VirtualEInk:
         state_code = {"HAPPY": "OPTIMAL", "SAD": "STRESSED", "SLEEPY": "REST",
                       "SICK": "CRITICAL"}.get(state.mood, "NOMINAL")
         rl.draw_text(f"ST {state_code} TRT {trt}", tx, dest_y + int(76 * S), fs, COLOR_INK)
-        is_night = ((state.age_sec % 86400) >= 57600)
+        # 概日表示 (FW effNight()と同一: TIME同期済みはホストJST、未同期は体内時計)
+        if wall_synced:
+            jst_h = ((int(time.time()) + 9 * 3600) % 86400) // 3600
+            is_night = (jst_h >= 21 or jst_h < 6)
+        else:
+            is_night = ((state.age_sec % 86400) >= 57600)
         day_str = "NGT" if is_night else "DAY"
         rl.draw_text(f"STG {state.stage_name} {hms} {day_str}", tx, dest_y + int(88 * S), fs, COLOR_INK)
 

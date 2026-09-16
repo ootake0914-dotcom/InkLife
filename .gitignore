@@ -1,0 +1,24 @@
+# Hardware tool binaries
+arduino-cli/
+
+# Arduino build artifacts
+*.bin
+*.elf
+*.map
+build/
+
+# Python virtual environment & cache
+.venv/
+pc-companion/.venv/
+__pycache__/
+*/__pycache__/
+*.py[cod]
+
+# Temporary & scratch directories
+scratch/
+art_backup_blob/
+repomix-output.xml
+*.log
+*.tmp
+.DS_Store
+Thumbs.db

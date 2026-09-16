@@ -30,14 +30,18 @@ inline void sleepCycle(uint32_t sec) {
   Serial.flush();
   delay(50);  // USBへの吐き出し待ち
 
-  // BOOTボタンが押されたままだとEXT0(LOW)で即座に再起動ループに陥るため、解放を待機
-  while (digitalRead(HAL_BTN_BOOT) == LOW) {
+  // BOOTボタンが押されたままだとEXT0(LOW)で即座に再起動ループに陥るため、解放を待機。
+  // 固着時は5秒で打ち切り、EXT0起床を武装しない (タイマ起床のみ。即時起床ループ回避)
+  bool bootHeld = false;
+  for (unsigned long w = millis(); digitalRead(HAL_BTN_BOOT) == LOW;) {
+    if (millis() - w > 5000) { bootHeld = true; break; }
     delay(10);
   }
   delay(20);  // チャタリング安定待ち
 
   esp_sleep_enable_timer_wakeup((uint64_t)sec * 1000000ULL);
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)HAL_BTN_BOOT, 0);  // BOOT押下で起床
+  if (!bootHeld)
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)HAL_BTN_BOOT, 0);  // BOOT押下で起床
   esp_deep_sleep_start();
 }
 

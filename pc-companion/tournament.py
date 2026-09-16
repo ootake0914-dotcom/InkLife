@@ -691,6 +691,8 @@ class TournamentUI:
         self.phase_timer = 0.0
         self.fatigue_sent = False
         self.should_exit = False
+        # 呼吸モーション専用の単調時計 (engine.time_leftは残り時間のため逆行する)
+        self.anim_t = 0.0
 
         # Clickable Card Rectangles
         self.btn_enter_arena = rl.Rectangle(440, 680, 400, 50)
@@ -724,6 +726,7 @@ class TournamentUI:
     def update(self, dt: float, serial_worker) -> bool:
         if self.should_exit:
             return True
+        self.anim_t += dt
 
         mouse_pos = rl.get_mouse_position()
         mouse_clicked = rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT)
@@ -1009,13 +1012,13 @@ class TournamentUI:
             rot_b = -90.0
 
         self.model_a.draw(
-            pos_a, scale=0.92, rot_y=rot_a, breathe=self.engine.time_left,
+            pos_a, scale=0.92, rot_y=rot_a, breathe=self.anim_t,
             squash_x=self.engine.a.squash_x, squash_y=self.engine.a.squash_y,
             rot_z=self.engine.a.rot_z if self.engine.a.fstate != FighterState.KO else 90.0
         )
 
         self.model_b.draw(
-            pos_b, scale=0.92, rot_y=rot_b, breathe=self.engine.time_left,
+            pos_b, scale=0.92, rot_y=rot_b, breathe=self.anim_t,
             squash_x=self.engine.b.squash_x, squash_y=self.engine.b.squash_y,
             rot_z=self.engine.b.rot_z if self.engine.b.fstate != FighterState.KO else -90.0
         )

@@ -19,7 +19,7 @@ static const uint8_t T_FOOD = 4;      // +amount1 (11B)。餌おすそわけ。�
 static const uint8_t T_PLAY = 5;      // 10B。遊びの誘い。受信→元気なら幸福+、PLAY返信
 static const uint8_t T_FIGHT = 6;     // +power1 (11B)。勝負。受信→aggression+乱数で勝敗
 static const uint8_t T_TRADE = 7;     // +give1+want1 (12B)。食料交換提案。余裕があれば受諾
-static const uint8_t T_EVENT = 8;     // +code1 (11B)。誕生=1/びょうき=3/おやすみ=4
+static const uint8_t T_EVENT = 8;     // +code1 (11B)。誕生=1/進化=2/びょうき=3/おやすみ=4
 static const float FREQ_MHZ = 923.0;  // 日本920MHz帯。法令遵守は運用者責任
 
 SX1262 radio = new Module(HAL_LORA_NSS, HAL_LORA_DIO1, HAL_LORA_RST, HAL_LORA_BUSY);

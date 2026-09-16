@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""tools/gen_sheets.py — assets/parts/sheet_*.png → src/display/art_sheet_*.h
+"""tools/gen_sheets.py — assets/parts/sheet_*.png → src/display/art/art_sheet_*.h
 
 sheet_gear.png (1024x1024 2x2) と sheet_hud.png (1024x256 1x4) を
 E-Ink用1bit XBMヘッダに変換する。jpg2ink.py to_bitmap と同一bit順
@@ -184,7 +184,7 @@ def main():
         print(art)
     if a.check:
         return
-    disp = os.path.join(ROOT, "src", "display")
+    disp = os.path.join(ROOT, "src", "display", "art")
     emit_header(os.path.join(disp, "art_sheet_gear.h"), "assets/parts/sheet_gear.png",
                 GEAR_SZ, gear, True)
     emit_header(os.path.join(disp, "art_sheet_hud.h"), "assets/parts/sheet_hud.png",

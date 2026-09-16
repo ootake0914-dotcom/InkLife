@@ -80,7 +80,22 @@ class TrainCutin:
         self.particles.clear()
 
         # サウンド & パーティクル生成
-        if res == "GREAT":
+        if res == "PERFECT":
+            sound_mgr.play("perfect_fanfare")
+            for _ in range(60):
+                ang = random.uniform(0, math.pi * 2)
+                spd = random.uniform(1.5, 4.0)
+                self.particles.append({
+                    "x": 0.0, "y": 1.2, "z": 0.0,
+                    "vx": math.cos(ang) * spd,
+                    "vy": random.uniform(2.0, 5.0),
+                    "vz": math.sin(ang) * spd,
+                    "col": rl.Color(255, random.choice([215, 235, 255]), random.choice([80, 150, 255]), 255),
+                    "life": 1.0, "size": random.uniform(0.05, 0.09)
+                })
+        elif res == "FLYING":
+            sound_mgr.play("flying_buzz")
+        elif res == "GREAT":
             sound_mgr.play("train_great")
             for _ in range(40):
                 ang = random.uniform(0, math.pi * 2)
@@ -135,6 +150,95 @@ class TrainCutin:
             p["vy"] -= 5.5 * dt
             p["life"] = max(0.0, p["life"] - dt * 0.7)
 
+# ---- オフライン簡易シミュレーション (FW creatureTick/doRebirth/applyInspectの移植) ----
+# 実機なしでも育成が進むよう、1実秒=30ゲーム秒で生理を回す。AI行動変化はなし (単純化)。
+
+def offline_tick(state):
+    """30ゲーム秒分の生理変化。FW creatureTick()と同一式"""
+    state.age_sec += 30
+    old = state.age_sec > 259200
+    state.hunger = min(100, state.hunger + (3 if old else 2))
+    for k in range(3):
+        state.habit[k] = max(0, state.habit[k] - 8)
+    if state.action == "SLEEP":
+        state.energy = min(100, state.energy + 10)
+    else:
+        state.energy = max(0, state.energy - 2)
+    if state.action == "FEED":
+        state.hunger = max(0, state.hunger - 12)
+    if state.action == "PLAY":
+        state.happiness = min(100, state.happiness + 8)
+        state.energy = max(0, state.energy - 4)
+    else:
+        state.happiness = max(0, state.happiness - 1)
+    if ((state.age_sec // 30) % 2) == 0 and state.cleanliness > 0:
+        state.cleanliness -= 1
+    if state.hunger >= 95 or state.energy == 0:
+        if state.health > 0:
+            state.health -= 1
+    elif state.hunger < 50 and state.happiness > 50 and state.cleanliness >= 30 and state.health < 100:
+        state.health += 1
+    if state.cleanliness < 30 and state.happiness > 0:
+        state.happiness -= 1
+    state.update_mood()
+
+
+def offline_pick_target(state):
+    raw = state.species_id % 12
+    best = MORPH_TRAIT_APTITUDE[raw] if 0 <= raw < 12 else (0, 1)
+    return best[0] if random.random() < 0.7 else best[1]
+
+
+def offline_inspect_apply(state, grade):
+    """FW applyInspectと同一経済。戻り値はイベント文"""
+    if state.energy < 15:
+        state.health = max(1, state.health - 5)
+        state.happiness = max(0, state.happiness - 10)
+        state.action = "STANDBY"
+        return "OVERWORK"
+    state.energy = max(0, state.energy - 15)
+    state.hunger = min(100, state.hunger + 12)
+    state.happiness = max(0, state.happiness - 5)
+    if grade == 4:
+        state.happiness = max(0, state.happiness - 3)
+        state.action = "STANDBY"
+        return "TR:FLYING"
+    if grade == 3:
+        state.action = "STANDBY"
+        return "TR:FAIL"
+    target = offline_pick_target(state)
+    gain = 5 if grade == 0 else (4 + random.randrange(2) if grade == 1 else 2 + random.randrange(2))
+    if grade <= 1:
+        state.happiness = min(100, state.happiness + 15)
+    if target == 0:
+        state.intelligence = min(100, state.intelligence + gain)
+    elif target == 1:
+        state.aggression = min(100, state.aggression + gain)
+    elif target == 2:
+        state.curiosity = min(100, state.curiosity + gain)
+    else:
+        state.sociability = min(100, state.sociability + gain)
+    state.habit[1] = min(100, state.habit[1] + 20)
+    state.action = "PLAY"
+    return ("TR:PERFECT!", "TR:GREAT!", "TR:SUCCESS")[grade]
+
+
+def offline_rebirth(state):
+    """FW doRebirthの簡易版 (遺伝なし。能力微変動＋世代+1＋新生値)"""
+    state.generation = min(255, state.generation + 1)
+    for attr in ("intelligence", "curiosity", "aggression", "sociability"):
+        setattr(state, attr, max(0, min(100, getattr(state, attr) + random.randint(-3, 3))))
+    state.age_sec = 0
+    state.health = 90
+    state.hunger = 20
+    state.energy = 90
+    state.happiness = 70
+    state.cleanliness = 80
+    state.habit = [0, 0, 0]
+    state.action = "STANDBY"
+    state.update_mood()
+
+
 class SerialWorker:
     """バックグラウンドで ESP32-S3 とのシリアル通信を維持・自動再接続するスレッド"""
     def __init__(self, parser: InkProtocolParser, eink: VirtualEInk):
@@ -144,7 +248,10 @@ class SerialWorker:
         self.connected = False
         self.running = True
         self.port_name = "AUTO"
-        self.lock = threading.Lock()
+        # TIME送信済みか (VirtualEInkの昼夜表示用。実機rtcUnixと一致する前提)
+        self.time_synced = False
+        # RLock: send()保持中に_add_log()が同ロックを取るため再入可能にする
+        self.lock = threading.RLock()
         # 状態共有ロック (CreatureState/field_grid/peers/logsは両スレッドで触る)。
         # 無ロックだと辞書リサイズ中のRuntimeErrorや盤面行ちぎれが起きる。
         self.state_lock = threading.Lock()
@@ -168,9 +275,15 @@ class SerialWorker:
             return evts
 
     def _add_log(self, text: str):
-        self.log_lines.append(text)
-        if len(self.log_lines) > 50:
-            self.log_lines.pop(0)
+        # 描画スレッドと共有するためロック下で操作 (行ちぎれ防止)
+        with self.lock:
+            self.log_lines.append(text)
+            if len(self.log_lines) > 50:
+                self.log_lines.pop(0)
+
+    def get_logs(self, n: int) -> List[str]:
+        with self.lock:
+            return list(self.log_lines[-n:])
 
     def _find_port(self) -> Optional[str]:
         if not SERIAL_AVAILABLE:
@@ -216,7 +329,10 @@ class SerialWorker:
                 target_port = self._find_port()
                 if target_port and SERIAL_AVAILABLE:
                     try:
-                        s = serial.Serial(target_port, 115200, timeout=0.1)
+                        # write_timeout必須: USB抜去・リセット中のWriteFile無限ブロックで
+                        # ワーカがlock保持のまま固まり、描画スレッドがpop_eventsで
+                        # 一緒に固まるデッドロックを防ぐ (白画面の犯人)。
+                        s = serial.Serial(target_port, 115200, timeout=0.1, write_timeout=1)
                         self.ser = s
                         self.port_name = target_port
                         self.connected = True
@@ -229,6 +345,7 @@ class SerialWorker:
                         time.sleep(0.3)
                         now_unix = int(time.time())
                         self.send(f"TIME {now_unix}")
+                        self.time_synced = True
                         self.send("FZ")
                         self.send("SP")
                         self.send("ID")
@@ -250,8 +367,11 @@ class SerialWorker:
                                 self.ser.write(msg.encode("utf-8"))
 
                         # 受信行の読み出し (状態更新はstate_lock下で一括)
-                        line_bytes = self.ser.readline()
-                        if line_bytes:
+                        # in_waitingがある限り一括ドレインしてPC側の読み遅れによるFW Txバッファ溢れを防止
+                        while self.ser and self.ser.is_open and self.ser.in_waiting > 0:
+                            line_bytes = self.ser.readline()
+                            if not line_bytes:
+                                break
                             line = line_bytes.decode("utf-8", errors="replace").strip()
                             if line:
                                 self._add_log(line)
@@ -303,12 +423,12 @@ def draw_mf2_status_panel(state: CreatureState, x: int, y: int):
     raw_species = state.species_id % 12
     best_traits = MORPH_TRAIT_APTITUDE[raw_species] if 0 <= raw_species < 12 else (0, 1)
 
-    # 4大パラメータ (POW, INT, SPD, SKI)
+    # 4大パラメータ (POW, INT, SPD, SKI)。Raylib既定フォントはASCIIのみのため英語表記。
     traits = [
-        ("ちから (POW)", state.aggression, 1, rl.Color(255, 100, 100, 255)),
-        ("かしこさ (INT)", state.intelligence, 0, rl.Color(100, 190, 255, 255)),
-        ("すばやさ (SPD)", state.curiosity, 2, rl.Color(100, 255, 180, 255)),
-        ("めいちゅう (SKI)", state.sociability, 3, rl.Color(255, 220, 100, 255)),
+        ("Power (POW)", state.aggression, 1, rl.Color(255, 100, 100, 255)),
+        ("Smart (INT)", state.intelligence, 0, rl.Color(100, 190, 255, 255)),
+        ("Speed (SPD)", state.curiosity, 2, rl.Color(100, 255, 180, 255)),
+        ("Charm (SKI)", state.sociability, 3, rl.Color(255, 220, 100, 255)),
     ]
 
     for i, (label, val, tid, bar_col) in enumerate(traits):
@@ -436,6 +556,10 @@ def main():
     sim_time = 0.0
     click_bounce = 0.0
     bubble_alpha = 1.0
+    # 反応速度検査ミニゲームの状態 (None or dict)。G開始・SPACE回答。
+    inspect_game = None
+    # オフライン生理tick用アキュムレータ (1実秒=30ゲーム秒)
+    offline_acc = 0.0
 
     # ボタン矩形定義
     btn_feed = rl.Rectangle(930, 680, 100, 36)
@@ -444,8 +568,11 @@ def main():
     btn_train = rl.Rectangle(930, 634, 100, 36)
     btn_reborn = rl.Rectangle(1040, 634, 100, 36)
     btn_photo = rl.Rectangle(1150, 634, 100, 36)
-    btn_bench = rl.Rectangle(1150, 588, 100, 36)
-    btn_tourney = rl.Rectangle(930, 588, 210, 36)  # トーナメント大会エントリーボタン
+    # 588行は4列 (幅74)。CUREは病時専用の小さな薬ボタン
+    btn_tourney = rl.Rectangle(930, 588, 74, 36)  # トーナメント大会エントリーボタン
+    btn_clean = rl.Rectangle(1010, 588, 74, 36)  # 掃除 (FW同時押しと同一)
+    btn_bench = rl.Rectangle(1090, 588, 74, 36)
+    btn_cure = rl.Rectangle(1170, 588, 74, 36)  # お薬 (FW CUREと同一。SICK圏外は無効)
 
     # アプリケーションモード (FARM <-> TOURNAMENT)
     # 引数に --tourney または -t がある場合は直接トーナメント大会から開始
@@ -526,6 +653,14 @@ void main() {
         if click_bounce > 0:
             click_bounce = max(0.0, click_bounce - dt * 4.0)
 
+        # オフライン生理tick (実機なしでも育成が進む。FW creatureTick移植)
+        if not serial_worker.connected:
+            offline_acc += dt
+            while offline_acc >= 1.0:
+                offline_acc -= 1.0
+                with serial_worker.state_lock:
+                    offline_tick(state)
+
         # シリアルイベントの受信・ディスパッチ (状態に触るためstate_lock下)
         with serial_worker.state_lock:
             pending_evts = serial_worker.pop_events()
@@ -542,6 +677,26 @@ void main() {
                     stat = FW_STAT_TO_DISPLAY.get(raw_stat, raw_stat)
                     gain = ev.get("gain", 0)
                     train_cutin.trigger(res, stat, gain, sound_mgr)
+                elif etype == "inspect":
+                    # FW検査結果 (INSPECT target/grade)。カットイン語彙に寄せる。
+                    grade = ev.get("grade", 3)
+                    res = ("PERFECT", "GREAT", "SUCCESS", "FAIL")[grade] if 0 <= grade <= 3 else "FAIL"
+                    raw_stat = ev.get("target", "INT")
+                    stat = FW_STAT_TO_DISPLAY.get(raw_stat, raw_stat)
+                    train_cutin.trigger(res, stat, 0, sound_mgr)
+                elif etype == "evolve":
+                    train_cutin.trigger("GREAT", "INT", 0, sound_mgr)
+                    sound_mgr.play("evolve_shine")
+                    state.speech_bubble = f"Evolution! Rank {ev.get('rank', '?')}!"
+                    state.speech_timer = 5.0
+                elif etype == "event":
+                    evt = ev.get("event", "")
+                    if evt == "OHAYO":
+                        sound_mgr.play("ohayo_birds")
+                    elif evt in ("CLEAN_OK", "SPOTLESS"):
+                        sound_mgr.play("clean_scrub")
+                    elif evt == "CURE_OK":
+                        sound_mgr.play("cure_chime")
 
         train_cutin.update(dt)
 
@@ -596,6 +751,72 @@ void main() {
         cam.position.z = math.cos(cam_angle) * math.cos(cam_pitch) * cam_dist
         cam.target = rl.Vector3(0.0, 0.75, 0.0)
 
+        # 反応速度検査ミニゲーム (G開始・SPACE回答。FW runInspectGameと同一経済)
+        # E-Ink実機はLED合図、PCは画面カウントダウン。GO前のSPACEはお手つき失格。
+        if rl.is_key_pressed(rl.GLFW_KEY_G) and inspect_game is None:
+            sound_mgr.play("click")
+            inspect_game = {"phase": "COUNT", "t0": sim_time,
+                            "go_at": sim_time + 1.8 + random.uniform(0.5, 1.5),
+                            "shown": 0, "flying": False,
+                            "result": 3, "until": 0.0}
+            with serial_worker.state_lock:
+                state.speech_bubble = "Reaction test... steady..."
+                state.speech_timer = 3.0
+        if inspect_game is not None:
+            ig = inspect_game
+            el = sim_time - ig["t0"]
+            if ig["phase"] == "COUNT":
+                count = 3 - int(el / 0.6)
+                if count != ig["shown"] and count >= 1:
+                    ig["shown"] = count
+                    sound_mgr.play("click")
+                if rl.is_key_pressed(rl.GLFW_KEY_SPACE):
+                    ig["flying"] = True
+                if el >= ig["go_at"]:
+                    if not ig["flying"]:
+                        ig["phase"] = "GO"
+                        ig["go_mark"] = sim_time
+                        sound_mgr.play("dock")
+                    else:
+                        # お手つき失格。FWに符号がないため送らず、 offline時のみ自前処理。
+                        ig["phase"] = "DONE"
+                        ig["result"] = 4
+                        ig["until"] = sim_time + 1.5
+                        if serial_worker.connected:
+                            with serial_worker.state_lock:
+                                state.speech_bubble = "TR:FLYING"
+                                state.speech_timer = 3.0
+                        else:
+                            with serial_worker.state_lock:
+                                ev = offline_inspect_apply(state, 4)
+                                train_cutin.trigger("FLYING", "INT", 0, sound_mgr)
+                                state.speech_bubble = ev
+                                state.speech_timer = 3.0
+            elif ig["phase"] == "GO":
+                grade = None
+                if rl.is_key_pressed(rl.GLFW_KEY_SPACE):
+                    dt_ms = int((sim_time - ig["go_mark"]) * 1000)
+                    grade = 0 if dt_ms <= 150 else (1 if dt_ms <= 400 else (2 if dt_ms <= 800 else 3))
+                elif sim_time - ig["go_mark"] >= 2.0:
+                    grade = 3
+                if grade is not None:
+                    if serial_worker.connected:
+                        serial_worker.send(f"INSPECT {grade}")  # FWが経済処理 (結果行でカットイン)
+                    else:
+                        with serial_worker.state_lock:
+                            ev = offline_inspect_apply(state, grade)
+                            res = {"TR:PERFECT!": "PERFECT", "TR:GREAT!": "GREAT",
+                                   "TR:SUCCESS": "SUCCESS", "TR:FAIL": "FAIL"}.get(ev, "FAIL")
+                            train_cutin.trigger(res, "INT", 0, sound_mgr)
+                            state.speech_bubble = ev
+                            state.speech_timer = 3.0
+                    ig["phase"] = "DONE"
+                    ig["result"] = grade
+                    ig["until"] = sim_time + 1.5
+            elif ig["phase"] == "DONE":
+                if sim_time >= ig["until"]:
+                    inspect_game = None
+
         # ボタン入力判定 (FW実効値と一致させる。旧楽観値はhabGain無視で乖離)
         if rl.check_collision_point_rec(mouse_pos, btn_feed) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
@@ -607,6 +828,7 @@ void main() {
                     state.hunger = max(0, state.hunger - 30)
                     state.happiness = min(100, state.happiness + hab_gain(5, state.habit[0]))
                     state.habit[0] = min(100, state.habit[0] + 25)
+                    state.cleanliness = max(0, state.cleanliness - 15)  # FW ui::feedと同一 (食ったら出す)
                 state.action = "FEED"  # FW表記 (E-Ink一致。art解決は正規化)
                 state.speech_bubble = "*munch munch* Delicious snack!"
                 state.speech_timer = 3.5
@@ -623,6 +845,32 @@ void main() {
                     state.energy = max(0, state.energy - 10)
                     state.action = "PLAY"
                     state.speech_bubble = "Yay! Playing games is awesome!"
+                state.speech_timer = 3.5
+
+        if rl.check_collision_point_rec(mouse_pos, btn_clean) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
+            serial_worker.send("CLEAN")
+            with serial_worker.state_lock:
+                if state.cleanliness >= 100:
+                    state.speech_bubble = "Already spotless!"
+                else:
+                    state.cleanliness = 100
+                    state.happiness = min(100, state.happiness + 3)
+                    state.action = "STANDBY"  # FWのIDLE相当 (PC表記)
+                    state.speech_bubble = "*scrub scrub* All clean!"
+                state.speech_timer = 3.5
+
+        if rl.check_collision_point_rec(mouse_pos, btn_cure) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
+            sound_mgr.play("click")
+            serial_worker.send("CURE")
+            with serial_worker.state_lock:
+                if state.health >= 50:
+                    state.speech_bubble = "Healthy! No medicine needed."
+                else:
+                    state.health = min(100, state.health + 30)
+                    state.happiness = max(0, state.happiness - 5)
+                    state.action = "STANDBY"  # FWのIDLE相当 (PC表記)
+                    state.speech_bubble = "*gulp* Bitter... but effective!"
                 state.speech_timer = 3.5
 
         if rl.check_collision_point_rec(mouse_pos, btn_train) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
@@ -692,6 +940,7 @@ void main() {
             sound_mgr.play("click")
             now_u = int(time.time())
             serial_worker.send(f"TIME {now_u}")
+            serial_worker.time_synced = True
             state.speech_bubble = f"Host time synced: {now_u}"
             state.speech_timer = 3.5
 
@@ -700,6 +949,10 @@ void main() {
             serial_worker.send("REBORN")
             state.speech_bubble = "Rebirth command sent! New generation awaits..."
             state.speech_timer = 3.5
+            if not serial_worker.connected:
+                with serial_worker.state_lock:
+                    offline_rebirth(state)
+                    state.speech_bubble = f"Reborn as Gen {state.generation}! (offline sim)"
 
         if rl.check_collision_point_rec(mouse_pos, btn_photo) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
@@ -730,7 +983,8 @@ void main() {
                 state.action,
                 state.mood,
                 state.fuse,
-                state.happiness
+                state.happiness,
+                state.age_sec
             )
 
             # 現象盤の実盤面を要求 (+LIFE更新ごと。FIELDB 12行で返る。接続中のみ)
@@ -748,13 +1002,16 @@ void main() {
                 serial_worker.send("AFF")
 
             # バーチャル E-Ink の更新 (内容変化時のみ再構築＋転送。盤面到着も含む)
-            ekey = (state.age_sec, state.action, state.mood, tuple(state.fuse),
-                    state.last_event, len(state.peers), state.health, state.hunger,
-                    state.energy, state.happiness, state.generation, state.species_id,
+            # FW dispHash相当: 分丸め・成長段で秒ゆらぎ再構築を抑止、4形質でTRAIN直後 staleを防止
+            ekey = (state.age_sec // 60, state.age_sec // 270, state.action, state.mood,
+                    tuple(state.fuse), state.last_event, len(state.peers),
+                    state.health, state.hunger, state.energy, state.happiness,
+                    state.intelligence, state.curiosity, state.aggression,
+                    state.sociability, state.generation, state.species_id,
                     state.field_seq)
             if ekey != eink_key:
                 eink_key = ekey
-                eink.render(state)
+                eink.render(state, wall_synced=serial_worker.time_synced)
 
         # セリフ吹き出しタイマー
         if state.speech_timer > 0:
@@ -923,23 +1180,26 @@ void main() {
         draw_mf2_status_panel(state, 395, 18)
 
         # キメラの吹き出し (Speech Bubble: カットイン中は非表示)
+        # 右端は3D領域内 (x<345) に収める (MF2パネルへの被り防止)
         if bubble_alpha > 0.05 and not train_cutin.active:
             bub_text = state.speech_bubble
             tw = rl.measure_text(bub_text, 16)
-            bx = max(30, min(500 - tw, 325 - tw // 2))
-            by = 120
             bw = tw + 32
+            bx = max(30, min(345 - bw, 325 - tw // 2))
+            by = 120
             bh = 40
             alpha_int = int(bubble_alpha * 255)
             rl.draw_rectangle_rounded(
                 rl.Rectangle(bx, by, bw, bh), 0.3, 6,
                 rl.Color(255, 255, 255, alpha_int)
             )
-            # 下向き三角
+            # 下向き三角 (吹き出し内に収める)
+            # 頂点は裏面カリング回避のため下頂点を2番目に置く (実測: 逆順は描画されない)
+            px = max(bx + 16, min(bx + bw - 16, 325))
             rl.draw_triangle(
-                rl.Vector2(325 - 8, by + bh),
-                rl.Vector2(325 + 8, by + bh),
-                rl.Vector2(325, by + bh + 10),
+                rl.Vector2(px - 8, by + bh),
+                rl.Vector2(px, by + bh + 10),
+                rl.Vector2(px + 8, by + bh),
                 rl.Color(255, 255, 255, alpha_int)
             )
             rl.draw_text(bub_text, bx + 16, by + 12, 16, rl.Color(20, 24, 32, alpha_int))
@@ -948,12 +1208,14 @@ void main() {
         draw_cutin_banner(train_cutin)
 
         # 左下: 3D 操作ヒント
-        rl.draw_text("L-Drag: Orbit Camera | Wheel: Zoom | Click Chimera: Pet", 24, WIN_H - 28, 11, COL_TXT_DIM)
+        rl.draw_text("L-Drag: Orbit Camera | Wheel: Zoom | Click Chimera: Pet | G: Reaction Game", 24, WIN_H - 28, 11, COL_TXT_DIM)
 
         # ===== 3. 右側: バーチャル E-Ink ディスプレイ (296x128 -> 592x256) =====
         eink_x = 668
         eink_y = 20
-        eink.draw_on_screen(eink_x, eink_y, scale=2.0, state=state)
+        eink.draw_on_screen(eink_x, eink_y, scale=2.0, state=state,
+                            wall_synced=serial_worker.time_synced,
+                            connected=serial_worker.connected)
 
         # ===== 4. 右側中段: 知人帳 (LoRa Mesh) レーダー & ソーシャルモニター =====
         panel_radar_y = 300
@@ -1003,7 +1265,7 @@ void main() {
         rl.draw_rectangle_lines(676, panel_lab_y + 32, 230, 218, COL_LINE)
 
         # 最新ログ表示
-        recent_logs = serial_worker.log_lines[-13:]
+        recent_logs = serial_worker.get_logs(13)
         for li, log_t in enumerate(recent_logs):
             l_col = COL_ACCENT if log_t.startswith("+EVT") else (rl.Color(110, 240, 140, 255) if log_t.startswith("+BORN") else COL_TXT_DIM)
             rl.draw_text(log_t[:30], 682, panel_lab_y + 38 + li * 16, 10, l_col)
@@ -1013,11 +1275,11 @@ void main() {
         rl.draw_text("LAB CONTROL / COMMANDS", ctrl_x, panel_lab_y + 12, 13, COL_ACCENT_AMB)
 
         # 形質レーダーグラフ風テキスト
-        rl.draw_text(f"Intellect (IN): {state.intelligence:2d}   Curiosity (CU): {state.curiosity:2d}", ctrl_x, panel_lab_y + 40, 12, COL_TXT_MAIN)
-        rl.draw_text(f"Aggress   (AG): {state.aggression:2d}   Sociable  (SO): {state.sociability:2d}", ctrl_x, panel_lab_y + 60, 12, COL_TXT_MAIN)
+        rl.draw_text(f"Intellect (IN): {state.intelligence:2d}   Curiosity (CU): {state.curiosity:2d}", ctrl_x, panel_lab_y + 38, 12, COL_TXT_MAIN)
+        rl.draw_text(f"Aggress   (AG): {state.aggression:2d}   Sociable  (SO): {state.sociability:2d}", ctrl_x, panel_lab_y + 58, 12, COL_TXT_MAIN)
         gears_str = ", ".join([GEAR_NAMES_EN[g] for g in state.effective_gears if g < len(GEAR_NAMES_EN)]) or "None"
-        rl.draw_text(f"Equipped Gears: {gears_str}", ctrl_x, panel_lab_y + 84, 11, COL_ACCENT)
-        rl.draw_text(f"Brian's Brain CA: Act {state.field_activity} / Sym {state.field_symmetry}", ctrl_x, panel_lab_y + 104, 11, COL_TXT_DIM)
+        rl.draw_text(f"Equipped Gears: {gears_str}", ctrl_x, panel_lab_y + 80, 11, COL_ACCENT)
+        rl.draw_text(f"Brian's Brain CA: Act {state.field_activity} / Sym {state.field_symmetry}", ctrl_x, panel_lab_y + 96, 11, COL_TXT_DIM)
 
         # ボタン描画ヘルパー
         def draw_button(rec: rl.Rectangle, label: str, col_acc: rl.Color):
@@ -1033,8 +1295,10 @@ void main() {
         draw_button(btn_train, "TRAIN", rl.Color(255, 180, 50, 255))
         draw_button(btn_reborn, "REBORN", rl.Color(255, 110, 220, 255))
         draw_button(btn_photo, "SNAPSHOT", COL_ACCENT_AMB)
-        draw_button(btn_tourney, "TOURNAMENT", rl.Color(255, 215, 0, 255))
+        draw_button(btn_tourney, "TOURNEY", rl.Color(255, 215, 0, 255))
+        draw_button(btn_clean, "CLEAN", rl.Color(140, 220, 255, 255))
         draw_button(btn_bench, "BENCH", COL_ACCENT)
+        draw_button(btn_cure, "CURE", rl.Color(150, 255, 170, 255))
 
         draw_button(btn_feed, "FEED", rl.Color(255, 140, 90, 255))
         draw_button(btn_play, "PLAY", rl.Color(100, 240, 160, 255))
@@ -1044,6 +1308,26 @@ void main() {
         if screenshot_timer > 0:
             rl.draw_rectangle(676, panel_lab_y + 215, 568, 30, rl.Color(40, 120, 70, 230))
             rl.draw_text(screenshot_msg, 690, panel_lab_y + 222, 13, rl.WHITE)
+
+        # 検査ゲームオーバーレイ (カウントダウン・GO・結果)
+        if inspect_game is not None:
+            ig = inspect_game
+            rl.draw_rectangle(0, 0, WIN_W, WIN_H, rl.Color(8, 10, 16, 140))
+            cx, cy = WIN_W // 2, WIN_H // 2 - 40
+            if ig["phase"] == "COUNT":
+                n = max(1, 3 - int((sim_time - ig["t0"]) / 0.6))
+                rl.draw_text(str(n), cx - 30, cy - 60, 120, rl.WHITE)
+                rl.draw_text("SPACE at GO!! (early = foul)", cx - 170, cy + 80, 16, COL_TXT_DIM)
+            elif ig["phase"] == "GO":
+                blink = (int(sim_time * 6) % 2 == 0)
+                rl.draw_text("GO!!", cx - 90, cy - 60, 120,
+                             rl.Color(100, 255, 150, 255) if blink else rl.WHITE)
+                rl.draw_text("SPACE NOW!", cx - 80, cy + 80, 20, rl.Color(255, 220, 90, 255))
+            else:
+                names = ("PERFECT!", "GREAT!", "GOOD", "FAIL", "FLYING (foul)")
+                g = ig.get("result", 3)
+                rl.draw_text(names[g] if 0 <= g <= 4 else "FAIL",
+                             cx - 110, cy - 50, 64, rl.Color(255, 215, 0, 255))
 
         rl.end_drawing()
 

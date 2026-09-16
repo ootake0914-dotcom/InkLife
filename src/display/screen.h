@@ -7,6 +7,7 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include "../hardware/hal.h"
 #include "../life/creature.h"
+#include "../life/evo.h"         // 早期形態の年齢境界 (EGG/LARVA_MAXを共有)
 #include "../genetics/breeding.h"  // fuseゾーン優劣 (genetics::zoneOf)
 #include "../env/field.h"          // 現象盤ミニ表示 (field::get)
 
@@ -31,90 +32,125 @@ inline bool init() {
   return digitalRead(HAL_EPD_BUSY) == LOW;
 }
 
-#include "art_ink_idle.h"
-#include "art_ink_happy.h"
-#include "art_ink_eat.h"
-#include "art_ink_sleep.h"
-#include "art_ink_sad.h"
+#include "art/art_ink_idle.h"
+#include "art/art_ink_happy.h"
+#include "art/art_ink_eat.h"
+#include "art/art_ink_sleep.h"
+#include "art/art_ink_sad.h"
 // 注: art_ink_greet.hはP0でFW表示から外した (全形態オーバーレイ統一)。ファイル自体は残し、
 // tools/make_artjs.cjs経由でPC側inkart.jsには引き続き同梱される。
 
 // 形態別専用アート (全12形態: idle, sleep, eat, happy, sad 完全網羅)
-#include "art_ink_m00_idle.h"
-#include "art_ink_m00_sleep.h"
-#include "art_ink_m00_eat.h"
-#include "art_ink_m00_happy.h"
-#include "art_ink_m00_sad.h"
+#include "art/art_ink_m00_idle.h"
+#include "art/art_ink_m00_sleep.h"
+#include "art/art_ink_m00_eat.h"
+#include "art/art_ink_m00_happy.h"
+#include "art/art_ink_m00_sad.h"
 
-#include "art_ink_m01_idle.h"
-#include "art_ink_m01_sleep.h"
-#include "art_ink_m01_eat.h"
-#include "art_ink_m01_happy.h"
-#include "art_ink_m01_sad.h"
+#include "art/art_ink_m01_idle.h"
+#include "art/art_ink_m01_sleep.h"
+#include "art/art_ink_m01_eat.h"
+#include "art/art_ink_m01_happy.h"
+#include "art/art_ink_m01_sad.h"
 
-#include "art_ink_m02_idle.h"
-#include "art_ink_m02_sleep.h"
-#include "art_ink_m02_eat.h"
-#include "art_ink_m02_happy.h"
-#include "art_ink_m02_sad.h"
+#include "art/art_ink_m02_idle.h"
+#include "art/art_ink_m02_sleep.h"
+#include "art/art_ink_m02_eat.h"
+#include "art/art_ink_m02_happy.h"
+#include "art/art_ink_m02_sad.h"
 
-#include "art_ink_m03_idle.h"
-#include "art_ink_m03_sleep.h"
-#include "art_ink_m03_eat.h"
-#include "art_ink_m03_happy.h"
-#include "art_ink_m03_sad.h"
+#include "art/art_ink_m03_idle.h"
+#include "art/art_ink_m03_sleep.h"
+#include "art/art_ink_m03_eat.h"
+#include "art/art_ink_m03_happy.h"
+#include "art/art_ink_m03_sad.h"
 
-#include "art_ink_m04_idle.h"
-#include "art_ink_m04_sleep.h"
-#include "art_ink_m04_eat.h"
-#include "art_ink_m04_happy.h"
-#include "art_ink_m04_sad.h"
+#include "art/art_ink_m04_idle.h"
+#include "art/art_ink_m04_sleep.h"
+#include "art/art_ink_m04_eat.h"
+#include "art/art_ink_m04_happy.h"
+#include "art/art_ink_m04_sad.h"
 
-#include "art_ink_m05_idle.h"
-#include "art_ink_m05_sleep.h"
-#include "art_ink_m05_eat.h"
-#include "art_ink_m05_happy.h"
-#include "art_ink_m05_sad.h"
+#include "art/art_ink_m05_idle.h"
+#include "art/art_ink_m05_sleep.h"
+#include "art/art_ink_m05_eat.h"
+#include "art/art_ink_m05_happy.h"
+#include "art/art_ink_m05_sad.h"
 
-#include "art_ink_m06_idle.h"
-#include "art_ink_m06_sleep.h"
-#include "art_ink_m06_eat.h"
-#include "art_ink_m06_happy.h"
-#include "art_ink_m06_sad.h"
+#include "art/art_ink_m06_idle.h"
+#include "art/art_ink_m06_sleep.h"
+#include "art/art_ink_m06_eat.h"
+#include "art/art_ink_m06_happy.h"
+#include "art/art_ink_m06_sad.h"
 
-#include "art_ink_m07_idle.h"
-#include "art_ink_m07_sleep.h"
-#include "art_ink_m07_eat.h"
-#include "art_ink_m07_happy.h"
-#include "art_ink_m07_sad.h"
+#include "art/art_ink_m07_idle.h"
+#include "art/art_ink_m07_sleep.h"
+#include "art/art_ink_m07_eat.h"
+#include "art/art_ink_m07_happy.h"
+#include "art/art_ink_m07_sad.h"
 
-#include "art_ink_m08_idle.h"
-#include "art_ink_m08_sleep.h"
-#include "art_ink_m08_eat.h"
-#include "art_ink_m08_happy.h"
-#include "art_ink_m08_sad.h"
+#include "art/art_ink_m08_idle.h"
+#include "art/art_ink_m08_sleep.h"
+#include "art/art_ink_m08_eat.h"
+#include "art/art_ink_m08_happy.h"
+#include "art/art_ink_m08_sad.h"
 
-#include "art_ink_m09_idle.h"
-#include "art_ink_m09_sleep.h"
-#include "art_ink_m09_eat.h"
-#include "art_ink_m09_happy.h"
-#include "art_ink_m09_sad.h"
+#include "art/art_ink_m09_idle.h"
+#include "art/art_ink_m09_sleep.h"
+#include "art/art_ink_m09_eat.h"
+#include "art/art_ink_m09_happy.h"
+#include "art/art_ink_m09_sad.h"
 
-#include "art_ink_m10_idle.h"
-#include "art_ink_m10_sleep.h"
-#include "art_ink_m10_eat.h"
-#include "art_ink_m10_happy.h"
-#include "art_ink_m10_sad.h"
+#include "art/art_ink_m10_idle.h"
+#include "art/art_ink_m10_sleep.h"
+#include "art/art_ink_m10_eat.h"
+#include "art/art_ink_m10_happy.h"
+#include "art/art_ink_m10_sad.h"
 
-#include "art_ink_m11_idle.h"
-#include "art_ink_m11_sleep.h"
-#include "art_ink_m11_eat.h"
-#include "art_ink_m11_happy.h"
-#include "art_ink_m11_sad.h"
+#include "art/art_ink_m11_idle.h"
+#include "art/art_ink_m11_sleep.h"
+#include "art/art_ink_m11_eat.h"
+#include "art/art_ink_m11_happy.h"
+#include "art/art_ink_m11_sad.h"
 
-#include "art_parts.h"
-#include "art_sheet_gear.h"  // sheet_gear.png由来 (ID 0/4/8/11。gen_sheets.py生成)
-#include "art_sheet_hud.h"   // sheet_hud.png由来 (HP/SAT/EN/HA)
+// 早期形態アート (タマゴ3段階＋幼生5感情。進化分岐P0: age駆動の素体差し替え)
+// 変換: tools/jpg2ink.py (assets/ink_egg_*.jpg, assets/ink_larva_*.jpg → 96x96 XBM)
+#include "art/art_ink_egg_idle.h"
+#include "art/art_ink_egg_crack.h"
+#include "art/art_ink_egg_hatch.h"
+#include "art/art_ink_larva_idle.h"
+#include "art/art_ink_larva_sleep.h"
+#include "art/art_ink_larva_eat.h"
+#include "art/art_ink_larva_happy.h"
+#include "art/art_ink_larva_sad.h"
+
+// 王冠 (反応検査PERFECT用。絵が未生成でも通るよう任意include)
+#if __has_include("art/art_test_crown.h")
+#include "art/art_test_crown.h"
+#define INK_HAS_CROWN 1
+#endif
+// うんち・季節帽子 (王冠と同一の透過合成パイプ)
+#if __has_include("art/art_ink_poop_1.h") && __has_include("art/art_ink_poop_2.h")
+#include "art/art_ink_poop_1.h"
+#include "art/art_ink_poop_2.h"
+#define INK_HAS_POOP 1
+#endif
+#if __has_include("art/art_ink_hat_pumpkin.h")
+#include "art/art_ink_hat_pumpkin.h"
+#define INK_HAS_HAT 1
+#endif
+#if __has_include("art/art_ink_hat_santa.h")
+#include "art/art_ink_hat_santa.h"
+#define INK_HAS_HAT_SANTA 1
+#endif
+#if __has_include("art/art_ink_hat_mochi.h")
+#include "art/art_ink_hat_mochi.h"
+#define INK_HAS_HAT_MOCHI 1
+#endif
+
+#include "art/art_parts.h"
+#include "art/art_sheet_gear.h"  // sheet_gear.png由来 (ID 0/4/8/11。gen_sheets.py生成)
+#include "art/art_sheet_hud.h"   // sheet_hud.png由来 (HP/SAT/EN/HA)
 
 // 12形態インデックス→装備アンカー基準形態。MORPH_5_MAPという旧名の配列は
 // 値が異なり未使用だったため削除済み。装備・fuse優劣は必ず本表を使うこと。
@@ -295,19 +331,56 @@ inline uint8_t headMidIndex(uint8_t mid) {
   }
 }
 
-inline void sprite(const Creature& c, Mood m, int ox, int oy) {
+// ---- 早期形態 (タマゴ/幼生) ----
+// 境界はevo::EGG_AGE_MAX/LARVA_AGE_MAX (life/evo.hと共有)。Creature本体・
+// NVS・LoRaには触らず、表示層だけで素体を差し替える (P0進化分岐の見た目部分)。
+inline bool isEggStage(uint32_t age_sec) { return age_sec < evo::EGG_AGE_MAX; }
+inline bool isLarvaStage(uint32_t age_sec) { return age_sec >= evo::EGG_AGE_MAX && age_sec < evo::LARVA_AGE_MAX; }
+
+// タマゴ3段階 (パラパラ孵化用に3等分。crack/hatchはidleと輪郭一致がマスタ約束)
+inline const unsigned char* eggArt(uint32_t age_sec) {
+  if (age_sec < 200) return ink_egg_idle_xbm;
+  if (age_sec < 400) return ink_egg_crack_xbm;
+  return ink_egg_hatch_xbm;
+}
+// 幼生5感情 (getMorphActionArtと同一の優先度: 睡眠>食事>喜び>悲しみ)
+inline const unsigned char* larvaArt(Action a, Mood m) {
+  bool isSleep = (a == Action::SLEEP || m == Mood::SLEEPY);
+  bool isEat = (a == Action::EAT);
+  bool isHappy = (a == Action::PLAY || m == Mood::HAPPY);
+  bool isSad = (m == Mood::SAD || m == Mood::SICK);
+  if (isSleep) return ink_larva_sleep_xbm;
+  if (isEat) return ink_larva_eat_xbm;
+  if (isHappy) return ink_larva_happy_xbm;
+  if (isSad) return ink_larva_sad_xbm;
+  return ink_larva_idle_xbm;
+}
+
+inline void sprite(const Creature& c, Mood m, int ox, int oy, bool crown = false, uint8_t hatKind = 0) {
   const unsigned char* art = nullptr;
   Action a = c.action;
   uint8_t raw = c.species_id % 12;
   uint8_t mid = ANCHOR_BASE_MAP[raw];
-  // 生形態の専用アクション絵 (0,1,2,4,5,7,10等) を取得
-  const unsigned char* dedicated = getMorphActionArt(raw, a, m);
-
-  if (dedicated) {
-    art = dedicated;
+  // 早期形態は純血固定: 素体だけ差し替え、fuse・オーバーレイは載せない。
+  // うんちマーカーは全形態共通で載せる (生理は平等)。
+  bool early = false;
+  bool hasDedicated = false;  // 自前アクション絵の有無 (オーバーレイ要否用)
+  if (isEggStage(c.age_sec)) {
+    art = eggArt(c.age_sec);
+    early = true;
+  } else if (isLarvaStage(c.age_sec)) {
+    art = larvaArt(a, m);
+    early = true;
   } else {
-    // 他形態に化けさせず、自前のIDLE絵を維持 (未対応形態はオーバーレイ演出で表現)
-    art = MORPH_IDLE_XBM[raw];
+    // 生形態の専用アクション絵 (0,1,2,4,5,7,10等) を取得
+    const unsigned char* dedicated = getMorphActionArt(raw, a, m);
+    if (dedicated) {
+      art = dedicated;
+      hasDedicated = true;
+    } else {
+      // 他形態に化けさせず、自前のIDLE絵を維持 (未対応形態はオーバーレイ演出で表現)
+      art = MORPH_IDLE_XBM[raw];
+    }
   }
 
   int dst = growthSize(c.age_sec);
@@ -325,10 +398,55 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
   auto ring = [&](int x, int y, int r) {
     disp.drawCircle(bx + SC(x), by + SC(y), max(1, SC(r)), GxEPD_BLACK);
   };
-  auto tri = [&](int x0, int y0, int x1, int y1, int x2, int y2) {
-    disp.fillTriangle(bx + SC(x0), by + SC(y0), bx + SC(x1), by + SC(y1), bx + SC(x2), by + SC(y2), GxEPD_WHITE);
-    disp.drawTriangle(bx + SC(x0), by + SC(y0), bx + SC(x1), by + SC(y1), bx + SC(x2), by + SC(y2), GxEPD_BLACK);
+  // 汎用96空間オーバーレイ (白透過・成長追従)。うんち・王冠・帽子共用。
+  auto overlay96s = [&](const unsigned char* xbm, int k) {
+    for (int y = 0; y < 96; y++) {
+      int row = y * 12;
+      for (int x = 0; x < 96; x++) {
+        if (xbm[row + (x >> 3)] & (1 << (x & 7))) {
+          int sx = 48 + (x - 48) * k / 100;
+          int sy = 48 + (y - 48) * k / 100;
+          disp.drawPixel(bx + SC(sx), by + SC(sy), GxEPD_BLACK);
+        }
+      }
+    }
   };
+  // イベント重ねは最前面 (fuseのマスク消去に埋もれないよう)。順序: うんち→王冠→帽子。
+  // 頭物は競合したら王冠優先 (実績が季節に勝つ)。幼生の頭物は65%に縮小。
+  auto eventOverlays = [&]() {
+#ifdef INK_HAS_POOP
+    // うんちは白抜きハロー付き (尻尾・装備に埋もれず前景に見せる。bbox+2px)。
+    if (c.cleanliness < 50) {
+      disp.fillRect(bx + SC(64), by + SC(71), max(1, SC(20)), max(1, SC(18)), GxEPD_WHITE);
+      overlay96s(ink_poop_1_xbm, 100);
+    }
+    if (c.cleanliness < 25) {
+      disp.fillRect(bx + SC(57), by + SC(74), max(1, SC(20)), max(1, SC(18)), GxEPD_WHITE);
+      overlay96s(ink_poop_2_xbm, 100);
+    }
+#else
+    if (c.cleanliness < 50) dot(78, 84, 6, 5);
+    if (c.cleanliness < 25) dot(68, 88, 5, 4);
+#endif
+    int hk = isLarvaStage(c.age_sec) ? 65 : 100;
+    // 王冠 (検査PERFECTの実績。季節帽子に優先。実績が季節に勝つ)
+#ifdef INK_HAS_CROWN
+    if (crown) overlay96s(art_test_crown_xbm, hk);
+#endif
+    // 季節帽子 (種類は呼出側が日付で解決。絵が無ければその種類だけ出ない)。
+    const unsigned char* hatXbm = nullptr;
+#ifdef INK_HAS_HAT
+    if (hatKind == 1) hatXbm = ink_hat_pumpkin_xbm;
+#endif
+#ifdef INK_HAS_HAT_SANTA
+    if (hatKind == 2) hatXbm = ink_hat_santa_xbm;
+#endif
+#ifdef INK_HAS_HAT_MOCHI
+    if (hatKind == 3) hatXbm = ink_hat_mochi_xbm;
+#endif
+    if (hatXbm && !crown) overlay96s(hatXbm, hk);
+  };
+  if (early) { eventOverlays(); return; }  // 早期形態はここまで (fuseなし)
   // 融合表示: 自形態＋fuse装備の全部載せ (Infinite Fusion式: 象徴だけ借りる)。
   // 同ゾーン競合の敗者は非表示 (選別。Niche式の部位優劣。変異・交配で再供給される)。
   // 画像を刻んだ遺伝パーツの境界マスク付きブレンド描画
@@ -434,7 +552,8 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy) {
   }
 
   // アクション演出オーバーレイ (専用アクション絵を持たない形態向け。dedicatedがある場合は自前画像で表現)
-  if (!dedicated) {
+  eventOverlays();  // 成体路も最前面 (早期路は上記return前に済み)
+  if (!hasDedicated) {
     if (a == Action::SLEEP || m == Mood::SLEEPY) {
       // 右上に浮かぶ「Zzz」
       ln(76, 8, 86, 8); ln(86, 8, 76, 18); ln(76, 18, 86, 18);
@@ -485,6 +604,8 @@ inline const char* morphName(uint16_t species) {
   }
 }
 inline void morphTag(const Creature& c, char* b) {  // b[12]。"WHISKER-10"(10字)+NUL
+  if (isEggStage(c.age_sec)) { snprintf(b, 12, "EGG"); return; }
+  if (isLarvaStage(c.age_sec)) { snprintf(b, 12, "LARVA"); return; }
   snprintf(b, 12, "%s-%02d", morphName(c.species_id), c.species_id % 12);
 }
 
@@ -539,20 +660,26 @@ inline void pushLog(const char* e, uint32_t age) {
 inline void logLine(int i, char* b) {  // b[28]
   if (!evLog[i][0]) { b[0] = 0; return; }
   char h[6]; fmtHM(evLogAge[i], h);  // 分丸め (秒はskip判定と矛盾するため)
-  snprintf(b, 28, ">T+%s %s", h, evLog[i]);
+  // イベント部は17字上限 (">T+99:59 "9字+17=26字。最長イベント12字なので実質無切断、
+  // 6pxフォントで156px→x270終端でパネル内。明示精度でformat-truncation警告を排除)
+  snprintf(b, 28, ">T+%s %.17s", h, evLog[i]);
 }
 
 // 表示内容hash (再描画skip判定用)。画素に表れる値だけを混ぜ、画素に表れない値は混ぜない:
 // 数値4種(表示通り生値)・分丸め年齢・成長段・行動・気分・4形質(TRT表示)・最終イベント・
-// 表示2行ログ(分丸め)・知人数。除外するもの: 現象盤 (装飾。追従更新で十分)、cleanliness
-// (非表示)、ID/世代/素体名 (世代内不変。転生はfull描画)。stateHash(監査用)とは別物。
+// 表示2行ログ(分丸め)・知人数・清潔帯(うんちマーカー)・早期形態素体。除外するもの:
+// 現象盤 (装飾。追従更新で十分)、ID/世代/素体名 (世代内不変。転生はfull描画)。
+// stateHash(監査用)とは別物。
 // dispHash一致 ⇒ 画素一致 (現象窓を除く) が成立するようdraw()と1:1対応させること。
 inline uint32_t dispHash(const Creature& c, const char* event, uint8_t friends) {
   uint32_t h = 2166136261UL;
   auto mix = [&](uint32_t v) { h = (h ^ v) * 16777619UL; };
   mix(c.health); mix((uint32_t)(100 - c.hunger)); mix(c.energy); mix(c.happiness);
+  mix(c.cleanliness / 25);  // うんちマーカー帯 (50/25境界と1:1。75帯は冗長だが無害)
   mix(c.age_sec / 60);
   mix(c.age_sec / 270);  // growthSize段差 (分丸めと非同期のため明示)
+  mix(isEggStage(c.age_sec) ? 1 : isLarvaStage(c.age_sec) ? 2 : 0);  // 早期形態素体
+  mix(c.age_sec / 200);  // タマゴ3段階境界 (eggArtの200/400s切替と1:1)
   mix((uint32_t)c.action);
   mix((uint32_t)creatureMood(c));
   mix(c.intelligence); mix(c.curiosity); mix(c.aggression); mix(c.sociability);
@@ -576,8 +703,8 @@ inline void splash(const Creature& c) {
     disp.drawRect(0, 0, 296, 128, GxEPD_BLACK);
     char l1[28], l2[16], mt[12];
     morphTag(c, mt);
-    snprintf(l1, sizeof(l1), "SPEC %s // GEN-01", c.name);
-    snprintf(l2, sizeof(l2), "MORPH %s", mt);
+    snprintf(l1, sizeof(l1), "SPEC %.8s // GEN-01", c.name);  // 名前は常に"INK"。明示精度で切断警告を排除
+    snprintf(l2, sizeof(l2), "MORPH %.6s", mt);
     textEN(88, 34, "INK-LIFE SYSTEM");
     textEN(78, 58, l1);
     textEN(92, 80, l2);
@@ -609,8 +736,10 @@ inline void fieldMini(const field::State& f, int ox, int oy) {
 }
 
 // 画面全体描画。full=trueでフル更新。friends=知人数 (0で非表示)。fld=nullで現象窓なし。
+// wallNight: -1=体内時計、0=DAY、1=NGT (壁時計同期時のみ呼出側が指定)。
+// hatKind: 季節帽子の種類 (0=なし 1=かぼちゃ 2=サンタ 3=鏡餅)。
 inline void draw(const Creature& c, const char* event, bool full, uint8_t friends = 0,
-                 const field::State* fld = nullptr) {
+                 const field::State* fld = nullptr, int wallNight = -1, uint8_t hatKind = 0) {
   disp.setRotation(1);
   if (full) disp.setFullWindow();
   else disp.setPartialWindow(0, 0, disp.width(), disp.height());
@@ -625,11 +754,15 @@ inline void draw(const Creature& c, const char* event, bool full, uint8_t friend
     disp.fillScreen(GxEPD_WHITE);
     disp.drawRect(0, 0, 296, 128, GxEPD_BLACK);
     // 標本窓
-    char up[8], sp[16], idl[24], row[24], l0[28], l1[28], tr[8];
+    char up[8], sp[20], idl[32], row[24], l0[28], l1[28], tr[8];
     snprintf(up, sizeof(up), "T+%s", hm);
     textEN(6, 11, "SPECIMEN");
     textEN(236, 11, up);
-    sprite(c, m, 4, 16);
+    bool crown = false;
+#ifdef INK_HAS_CROWN
+    crown = strcmp(event, "TR:PERFECT!") == 0;  // 王冠はイベント駆動 (次イベントで自動消灯)
+#endif
+    sprite(c, m, 4, 16, crown, hatKind);
     disp.drawLine(4, 16, 12, 16, GxEPD_BLACK); disp.drawLine(4, 16, 4, 24, GxEPD_BLACK);
     disp.drawLine(100, 16, 92, 16, GxEPD_BLACK); disp.drawLine(100, 16, 100, 24, GxEPD_BLACK);
     disp.drawLine(4, 112, 12, 112, GxEPD_BLACK); disp.drawLine(4, 112, 4, 104, GxEPD_BLACK);
@@ -639,7 +772,7 @@ inline void draw(const Creature& c, const char* event, bool full, uint8_t friend
     // モニタ
     disp.drawLine(108, 4, 108, 124, GxEPD_BLACK);
     int tx = 114;
-    if (friends > 0) snprintf(idl, sizeof(idl), "ID %s %s P%u", idb, gb, friends);
+    if (friends > 0) snprintf(idl, sizeof(idl), "ID %s %s P%u", idb, gb, (unsigned)friends);
     else snprintf(idl, sizeof(idl), "ID %s %s", idb, gb);
     textEN(tx, 13, idl);
     snprintf(row, sizeof(row), "HP  %03d", c.health);
@@ -660,13 +793,14 @@ inline void draw(const Creature& c, const char* event, bool full, uint8_t friend
       fieldMini(*fld, 240, 60);
       char fb[10];
       snprintf(fb, sizeof(fb), "FLD %3d", field::activity(*fld));
-      textEN(198, 73, fb);
+      // x190配置: ACT最長(STANDBY)末尾180＋余白、末尾232で現象窓(240〜)と8px開ける
+      textEN(190, 73, fb);
     }
     traitLabel(c, tr);
     snprintf(row, sizeof(row), "ST %s TRT %s", stateCode(m), tr);
     textEN(tx, 85, row);
     snprintf(row, sizeof(row), "STG %s %s%s", stageName(c.age_sec), hm,
-             creatureNight(c.age_sec) ? " NGT" : " DAY");
+             (wallNight >= 0 ? wallNight == 1 : creatureNight(c.age_sec)) ? " NGT" : " DAY");
     textEN(tx, 97, row);
     logLine(0, l0); textEN(tx, 110, l0);
     logLine(1, l1); textEN(tx, 121, l1);

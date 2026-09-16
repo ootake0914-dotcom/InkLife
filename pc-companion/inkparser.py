@@ -1,18 +1,17 @@
 # pc-companion/inkparser.py
 """
 InkLife シリアルプロトコル解析 & 状態モデル
-ファームウェアが出力する +LIFE, +EVT, +BORN, +AFF, +FZ, +FIELD 等の行を解析し、
+ファームウェアが出力する +LIFE, +EVT, +BORN, +EVOLVE, +INSPECT, +TEST,
++AFF, +FZ, +FIELD, +CARE 等の行を解析し、
 内部のキメラ状態・知人帳・現象盤ログをリアルタイムに更新します。
 """
 
 import re
 from typing import Dict, List, Optional, Any, Tuple
 
-# 形態マップ
-# FW screen.h 準拠:
-# - MORPH_5_MAP は旧定義 (現在FWでは未使用)。互換のため残すが使用禁止。
-# - ANCHOR_BASE_MAP が装備アンカー & fuse優劣の正規マップ (実機正)。
-MORPH_5_MAP = [0, 1, 2, 1, 4, 2, 7, 7, 0, 1, 2, 0]  # LEGACY: FWでは未使用
+# 形態マップ (FW screen.h 準拠)
+# ANCHOR_BASE_MAP が装備アンカー & fuse優劣の正規マップ (実機正)。
+# 旧MORPH_5_MAPはFW削除に追随し撤去済み (値が異なり使用禁止だったもの)。
 ANCHOR_BASE_MAP = [0, 1, 2, 1, 4, 2, 1, 7, 0, 4, 10, 0]  # FW ANCHOR_BASE_MAP そのまま
 MORPH_NAMES = {0: "SLIME", 1: "DRAGON", 2: "SHIBA", 3: "SPINE", 4: "CAT", 5: "HALO", 6: "FIN", 7: "FROG", 8: "SPIRAL", 9: "LEG", 10: "WHISKER", 11: "STAR"}
 GEAR_NAMES = [
@@ -88,11 +87,11 @@ SLEEP_HEAD_MIDS = (0, 1, 2, 4, 7, 10)
 SLEEP_HEAD_OFF = [(0, 10), (-4, 10), (0, 5), (-6, 16), (0, 14), (-2, 5)]
 
 def sleep_head_off(mid: int):
-    """睡眠時HEADオフセット (dx, dy)。HEAD帯以外・未知midは (0, 0)"""
+    """睡眠時HEADオフセット (dx, dy)。FW headMidIndexと同一 (未知midは狐に倒す)"""
     try:
         return SLEEP_HEAD_OFF[SLEEP_HEAD_MIDS.index(mid)]
     except ValueError:
-        return (0, 0)
+        return SLEEP_HEAD_OFF[5]
 
 def normalize_action(action: str) -> str:
     """FWのシリアル表記 (STANDBY/FEED/UPLINK/...) をPC内部名に正規化。
@@ -181,6 +180,16 @@ EVENT_SPEECH = {
     "DAYBREAK": "Morning! Sunlight charging...",
     "DEAD": "Reincarnating to next Gen...",
     "STAY": "PC Link Active (Always-On)",
+    "EVOLVE": "Evolution! New form!",
+    "EVOLVE_RX": "Peer evolved! Congrats!",
+    "OHAYO": "Good morning! *chirp*",
+    "CLEAN_OK": "*scrub scrub* All clean!",
+    "SPOTLESS": "Already spotless!",
+    "CURE_OK": "Medicine taken... feeling better!",
+    "NO_NEED": "Healthy! No medicine needed.",
+    "TR:PERFECT!": "PERFECT!! Crown earned!",
+    "TR:FLYING": "Oops... jumped the gun...",
+    "TEST_START": "Reaction test... steady...",
 }
 
 class PeerInfo:
@@ -190,6 +199,7 @@ class PeerInfo:
         self.known = known
         self.species = species
         self.rssi = rssi
+        self.fuse: List[int] = [255, 255, 255, 255]  # FW知人帳fz (v3 STATUS)
 
 class CreatureState:
     def __init__(self):
@@ -225,6 +235,9 @@ class CreatureState:
 
         # 感情計算 (SICK, SLEEPY, SAD, HAPPY, NORMAL)
         self.mood: str = "NORMAL"
+
+        # 初回+LIFE受信済みか (接続直後のデモ値＋生ID混在の Frankenstein 表示防止用)
+        self.has_life: bool = False
 
     def update_mood(self):
         if self.health < 30:
@@ -279,6 +292,9 @@ class InkProtocolParser:
     RE_HEARD = re.compile(r"^\+HEARD did=([0-9A-Fa-f]+) type=(\w+)(?: rssi=(-?[\d\.]+))?")
     RE_RESTORED = re.compile(r"^\+RESTORED src=(\w+) absence=(\d+) boots=(\d+)")
     RE_TRAIN = re.compile(r"^\+TRAIN res=(\w+)(?: stat=(\w+) gain=(\d+))?(?: hp=(\d+))?(?: en=(\d+))?(?: ha=(\d+))?")
+    RE_EVOLVE = re.compile(r"^\+EVOLVE (\d+)->(\d+) rank=([SABC]) score=(-?\d+) g=(\d+) m=(\d+) ow=(\d+) bond=(-?\d+) riv=(-?\d+)")
+    RE_INSPECT = re.compile(r"^\+INSPECT target=(\w+) grade=(\d+) dt=(-?\d+)")
+    RE_TEST = re.compile(r"^\+TEST (3|2|1|GO!!)$")
 
     def __init__(self, state: CreatureState):
         self.state = state
@@ -302,6 +318,7 @@ class InkProtocolParser:
             self.state.curiosity = int(m.group(9))
             self.state.aggression = int(m.group(10))
             self.state.sociability = int(m.group(11))
+            self.state.has_life = True
             self.state.update_mood()
             return {"type": "life"}
 
@@ -352,10 +369,44 @@ class InkProtocolParser:
             self.state.species_id = int(m.group(4))
             fz = [int(x) for x in m.group(5).split(",")]
             self.state.fuse = (fz + [255] * 4)[:4]
+            # FW doRebirthと同一の新生値 (+LIFEまでの30秒が生まれたてに見えるよう)
+            self.state.age_sec = 0
+            self.state.health = 90
+            self.state.hunger = 20
+            self.state.energy = 90
+            self.state.happiness = 70
+            self.state.cleanliness = 80
+            self.state.habit = [0, 0, 0]
             self.state.speech_bubble = f"Reborn as Gen {self.state.generation} Chimera!"
             self.state.speech_timer = 5.0
             self.state.update_mood()
             return {"type": "born"}
+
+        # +EVOLVE (形態のみ上書き。血統variant維持はFW側で済み。+LIFE待ちだと旧姿のまま)
+        m = self.RE_EVOLVE.match(line)
+        if m:
+            after = int(m.group(2))
+            if 0 <= after <= 11:
+                self.state.species_id = self.state.species_id - (self.state.species_id % 12) + after
+            self.state.speech_bubble = f"Evolution! Rank {m.group(3)}!"
+            self.state.speech_timer = 5.0
+            self.state.update_mood()
+            return {"type": "evolve", "before": int(m.group(1)), "after": after,
+                    "rank": m.group(3), "score": int(m.group(4))}
+
+        # +INSPECT (PC検査・FW検査の結果。カットインは呼出側)
+        m = self.RE_INSPECT.match(line)
+        if m:
+            return {"type": "inspect", "target": m.group(1), "grade": int(m.group(2)),
+                    "dt": int(m.group(3))}
+
+        # +TEST (検査カウントダウン・GO合図。PCゲーム同期用)
+        m = self.RE_TEST.match(line)
+        if m:
+            mark = m.group(1)
+            self.state.speech_bubble = "GO!! Press BOOT!" if mark == "GO!!" else f"{mark}..."
+            self.state.speech_timer = 2.0
+            return {"type": "test", "mark": mark}
 
         # +FZ
         m = self.RE_FZ.match(line)
@@ -399,17 +450,24 @@ class InkProtocolParser:
         if m:
             return {"type": "aff_n", "n": int(m.group(1))}
 
-        # +AFF <did> aff=...
+        # +AFF <did> aff=... (末尾の fz=.. はv3融合遺伝子。無ければ欠落扱い)
         m = self.RE_AFF_PEER.match(line)
         if m:
             did = m.group(1).upper()
             aff = int(m.group(2))
             known = m.group(3) == "known"
+            fz_m = re.search(r"fz=(\d+),(\d+),(\d+),(\d+)", line)
+            fz = [int(fz_m.group(i)) for i in range(1, 5)] if fz_m else None
             if did in self.state.peers:
                 self.state.peers[did].aff = aff
                 self.state.peers[did].known = known
+                if fz is not None:
+                    self.state.peers[did].fuse = fz
             else:
-                self.state.peers[did] = PeerInfo(did, aff, known)
+                peer = PeerInfo(did, aff, known)
+                if fz is not None:
+                    peer.fuse = fz
+                self.state.peers[did] = peer
             return {"type": "aff_peer", "did": did}
 
         # +AFF habit=

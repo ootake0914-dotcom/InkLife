@@ -145,6 +145,44 @@ class SoundManager:
             (1760.0, 90, 'pulse', 0.75),
         ]))
 
+        # 16. パパパパーン！ (検査・PERFECT王冠ファンファーレ: G5 -> C6 -> E6 -> G6)
+        self._register("perfect_fanfare", _synth_wav([
+            (783.99, 70, 'square', 0.70),    # G5
+            (1046.50, 70, 'square', 0.75),   # C6
+            (1318.51, 70, 'square', 0.75),   # E6
+            (1567.98, 300, 'pulse', 0.85),   # G6 (キーンと響く)
+        ]))
+
+        # 17. ブッブー！ (検査・お手つき失格: 低い矩形波2連)
+        self._register("flying_buzz", _synth_wav([
+            (196.00, 140, 'square', 0.70),
+            (155.56, 220, 'square', 0.70),
+        ]))
+
+        # 18. キュッキュッ！ (掃除: 短い摩擦パルス3連)
+        self._register("clean_scrub", _synth_wav([
+            (1200, 35, 'pulse', 0.45),
+            (1500, 35, 'pulse', 0.45),
+            (1200, 35, 'pulse', 0.45),
+        ]))
+
+        # 19. ポロン♪ (お薬: 優しい回復アルペジオ A5 -> D6)
+        self._register("cure_chime", _synth_wav([
+            (880.00, 90, 'triangle', 0.60),
+            (1174.66, 200, 'triangle', 0.65),
+        ]))
+
+        # 20. キラーン！ (進化: 上昇グリッサンド C6 -> C7)
+        self._register("evolve_shine", _synth_wav([
+            ((1046.50, 2093.00), 420, 'pulse', 0.75),
+        ]))
+
+        # 21. ピヨピヨ！ (おはよう: 小鳥のさえずり2連)
+        self._register("ohayo_birds", _synth_wav([
+            ((1567.98, 2093.00), 90, 'pulse', 0.55),
+            ((1760.00, 2349.32), 130, 'pulse', 0.55),
+        ]))
+
         # 8. 試合開始ゴング (ノイズ+矩形波 240Hz→75Hz 下降スライド 800ms)
         self._register("battle_gong", _synth_wav([
             ((240, 75), 800, 'square', 0.80),

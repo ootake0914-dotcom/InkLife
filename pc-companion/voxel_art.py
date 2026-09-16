@@ -72,7 +72,7 @@ class ArtDataManager:
     def _load_sheet(self, fname: str) -> Dict[str, dict]:
         """gen_sheets.py生成ヘッダ (VAR_W/H + var_bmp/var_mask) を読む。"""
         disp = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "..", "src", "display")
+                            "..", "src", "display", "art")
         out: Dict[str, dict] = {}
         try:
             with open(os.path.join(disp, fname), "r", encoding="utf-8") as f:
@@ -149,13 +149,15 @@ class ChimeraVoxelModel:
         self.cache_key: str = ""
         self.base_color: rl.Color = rl.Color(48, 195, 140, 255)
 
-    def build(self, species_id: int, action: str, mood: str, fuse: List[int], happiness: int = 70):
+    def build(self, species_id: int, action: str, mood: str, fuse: List[int], happiness: int = 70, age_sec: int = 999999):
         raw = species_id % 12
         mid = ANCHOR_BASE_MAP[raw]
-        effective_gears = fuse_shown_gears(fuse, mid, raw)
+        # 早期形態 (タマゴ/幼生) は純血固定でパーツなし (FW sprite()早期returnと同一)
+        effective_gears = [] if age_sec < 7200 else fuse_shown_gears(fuse, mid, raw)
         # FW表記ゆれ対策: 正規化後の行動で鍵を作り、同一絵の無駄再ビルドを防ぐ
         act = normalize_action(action)
-        key = f"{species_id}_{mid}_{act}_{mood}_{','.join(map(str, effective_gears))}_{happiness // 25}"
+        early = 0 if age_sec >= 7200 else (1 if age_sec >= 600 else 2 + age_sec // 200)
+        key = f"{species_id}_{mid}_{act}_{mood}_{','.join(map(str, effective_gears))}_{happiness // 25}_{early}"
         if key == self.cache_key and self.voxels:
             return
 
@@ -164,7 +166,7 @@ class ChimeraVoxelModel:
         self.stars.clear()
 
         # 1. フレーム名の決定 (idleは12独立、動作は5基幹にフォールバック)
-        frame_name = self._resolve_frame_name(raw, mid, action, mood)
+        frame_name = self._resolve_frame_name(raw, mid, action, mood, age_sec)
         frame_bytes = ART_DB.get_frame_bytes(frame_name)
         if not frame_bytes or len(frame_bytes) < 1152:
             return
@@ -383,7 +385,19 @@ class ChimeraVoxelModel:
             return 0.03
         return 0.05  # AURA (星・ハイライト): 前面で浮遊
 
-    def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str) -> str:
+    def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str, age_sec: int = 999999) -> str:
+        # FW screen.h sprite() と同一: 600s未満=タマゴ3段階、7200s未満=幼生5感情
+        if age_sec < 600:
+            if age_sec < 200: return "ink_egg_idle"
+            if age_sec < 400: return "ink_egg_crack"
+            return "ink_egg_hatch"
+        if age_sec < 7200:
+            act = normalize_action(action)
+            if act == "SLEEP" or mood == "SLEEPY": return "ink_larva_sleep"
+            if act == "EAT": return "ink_larva_eat"
+            if act == "PLAY" or mood == "HAPPY": return "ink_larva_happy"
+            if mood in ("SAD", "SICK"): return "ink_larva_sad"
+            return "ink_larva_idle"
         # 全12形態 (0〜11) が専用アクション絵を完全保持
         # FWは STANDBY/FEED/UPLINK 表記、PC内部は IDLE/EAT/COMM。両方受ける。
         act = normalize_action(action)

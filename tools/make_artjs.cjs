@@ -1,15 +1,16 @@
 #!/usr/bin/env node
 // tools/make_artjs.cjs — firmware XBM headers -> pc-companion/inkart.js
 // Usage: node tools/make_artjs.cjs   (run from InkLife/ root)
-// Reads: src/display/art_*.h (morph action art + greet),
-//        src/display/pending_morphs/art_*.h (idle previews),
-//        src/display/art_parts.h (fuse part bitmaps + PART_ROWS anchors).
+// Reads: src/display/art/art_*.h (morph action art + greet; XBMのみ抽出、RLEは無視),
+//        src/display/art/art_parts.h (fuse part bitmaps + masks + PART_ROWS anchors).
+//   注: pending_morphs/ ディレクトリは存在しない (旧コメントの名残で削除)。
+//   ベース素体5枚 (ink_idle/happy/eat/sleep/sad) はFW未使用のため除外する.
 // Writes: pc-companion/inkart.js  (window.InkArt, no deps)
 const fs = require('node:fs');
 const path = require('node:path');
 
 const ROOT = path.resolve(__dirname, '..');
-const DISP = path.join(ROOT, 'src', 'display');
+const DISP = path.join(ROOT, 'src', 'display', 'art');
 const OUT = path.join(ROOT, 'pc-companion', 'inkart.js');
 
 function read(f) { return fs.readFileSync(f, 'utf8'); }

@@ -10,10 +10,12 @@ namespace store {
 
 static const char* NS = "inklife";
 static const uint32_t MAGIC = 0x494E4C34;  // "INK4"
-static const uint8_t VER = 2;  // v2: habit[3]追加。v1読込互換あり (飽き0扱い)
+static const uint8_t VER = 3;  // v3: お世話カウンタ(cg/cm/ow)追加。v1/v2読込互換あり (0扱い)
 
 // NVSへ保存。戻り値=falseは書込失敗。pev=未送EVENT (再起動越え用)。
-inline bool save(const Creature& c, const char* event, uint64_t rtc_us, uint32_t unix, uint8_t pendingEvt) {
+// cg/cm/ow=お世話カウンタ (進化判定用。Creature本体48Bには入れない別枠)。
+inline bool save(const Creature& c, const char* event, uint64_t rtc_us, uint32_t unix, uint8_t pendingEvt,
+                 uint16_t cg, uint16_t cm, uint16_t ow) {
   Preferences p;
   if (!p.begin(NS, false)) return false;
   p.putULong("magic", MAGIC);
@@ -41,17 +43,21 @@ inline bool save(const Creature& c, const char* event, uint64_t rtc_us, uint32_t
   p.putUChar("hb0", c.habit[0]);
   p.putUChar("hb1", c.habit[1]);
   p.putUChar("hb2", c.habit[2]);
+  p.putUShort("cg", cg);
+  p.putUShort("cm", cm);
+  p.putUShort("ow", ow);
   p.end();
   return true;
 }
 
 // NVSから復元。戻り値false=データ無し/世代不一致 (新規個体にすること)。
-// pev無し旧データは0扱い (後方互換)。v1はhabit無し→0扱い。
-inline bool load(Creature& c, char* event, size_t evlen, uint64_t& rrtc, uint32_t& runix, uint8_t& pev) {
+// pev無し旧データは0扱い (後方互換)。v1はhabit無し→0扱い。v2以前はcare無し→0扱い。
+inline bool load(Creature& c, char* event, size_t evlen, uint64_t& rrtc, uint32_t& runix, uint8_t& pev,
+                 uint16_t& cg, uint16_t& cm, uint16_t& ow) {
   Preferences p;
   if (!p.begin(NS, true)) return false;
   uint8_t v = p.getUChar("ver", 0);
-  bool ok = p.getULong("magic", 0) == MAGIC && (v == 1 || v == VER);
+  bool ok = p.getULong("magic", 0) == MAGIC && (v == 1 || v == 2 || v == VER);
   if (ok) {
     uint32_t did = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFFFF);
     ok = p.getULong("did", 0) == did;  // 別チップのデータは使わない
@@ -86,6 +92,13 @@ inline bool load(Creature& c, char* event, size_t evlen, uint64_t& rrtc, uint32_
     c.habit[2] = p.getUChar("hb2", 0);
   } else {
     for (int i = 0; i < 3; i++) c.habit[i] = 0;  // v1データは飽きなし扱い
+  }
+  if (v >= 3) {
+    cg = p.getUShort("cg", 0);
+    cm = p.getUShort("cm", 0);
+    ow = p.getUShort("ow", 0);
+  } else {
+    cg = cm = ow = 0;  // v2以前はお世話記録なし扱い
   }
   p.getString("ev", event, evlen);  // 直接バッファ読み (String不使用)
   event[evlen - 1] = 0;

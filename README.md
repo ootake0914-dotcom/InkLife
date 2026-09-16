@@ -166,20 +166,38 @@ Overwork inflicts severe health penalties, accumulates lifetime fatigue (`overwo
 | **BOOT Button** | Short Click (< 0.5s) | **FEED** | Nourish creature (restores hunger, slight happiness boost) |
 | **BOOT Button** | Long Press (> 1.2s) | **SHARE FOOD** | Broadcast emergency food nutrient packet over LoRa |
 | **SIDE Button** | Short Click (< 0.5s) | **PLAY** | Interactive play (boosts happiness, consumes energy) |
-| **SIDE Button** | Long Press (> 1.2s) | **TRAIN** | MF2-style training focused on species-dominant aptitude |
+| **SIDE Button** | Long Press (> 1.2s) | **INSPECT** | Reaction test minigame (manual training, skill-based gains) |
+| **BOOT + SIDE** | Simultaneous Press | **CLEAN** | Clean droppings (restores cleanliness, small happiness boost) |
 
 ### Serial Command Interface (115200 bps)
 ```text
 FEED                      # Feed creature immediately
 PLAY                      # Play with creature
-TRAIN [INT|AGGR|CURIO|SOC]# Execute targeted or auto training
-TIME <unix_timestamp>     # Synchronize system RTC with host PC
+CLEAN                     # Clean droppings (serial/PC parallel to simultaneous press)
+CURE                      # Administer medicine (serial/PC only, effective when sick)
+TRAIN [INT|AGGR|CURIO|SOC]# Execute targeted or auto training (dice, automatic)
+INSPECT <0..3>            # Apply PC-hosted minigame result (0:PERFECT..3:FAIL)
+TIME <unix_timestamp>     # Synchronize system RTC with host PC (drives JST day/night AI & morning bonus)
 SP                        # Query species and morph metadata
 FZ                        # Query 4-zone equipped chimera genes
 AFF                       # Print social acquaintance ledger & affinities
+CARE                      # Print care counters & evolution score breakdown
 BENCH                     # Benchmark sprite renderer cycle count
 REBORN                    # Trigger generational succession
 ```
+
+> [!WARNING]
+> **【重要】シリアル通信の詰まり・動作遅延に関する注意点 (Serial Congestion & Blocking Prevention)**
+> ESP32-S3 のハードウェア USB-CDC（仮想COMポート）では、シリアル送受信バッファの滞留によってファームウェアのメインループ（E-Ink描画や生物シミュレーション）がブロッキングし、ボードの動作が極端に重くなる（フリーズする）現象が発生します。以下の設計原則を厳守してください：
+> 
+> 1. **ホスト未接続・読み出し停止時の送信ブロッキング防止**:
+>    - PC側でシリアルポートを開いていない場合や読み出しが滞った場合、送信バッファ（TX FIFO）が満杯になると `Serial.print()` / `Serial.println()` が内部で完了待ちブロッキングを起こします。
+>    - 送信時は `Serial.availableForWrite()` で空き容量を確認するか、バッファフル時はパケットをスキップ（ドロップ）する安全制御を実装してください。
+> 2. **受信処理の完全非ブロッキング化**:
+>    - `Serial.readStringUntil('\n')` などのブロッキングAPIは使用禁止です。改行コードが欠落した場合にタイムアウトまでメインループ全体が停止します。
+>    - `Serial.available()` を確認し、1バイトずつリングバッファ／行バッファへ蓄積する非ブロッキング受信を行ってください。
+> 3. **PCコンパニオン側での高頻度連投の抑制**:
+>    - ホストPC側（`companion.py` 等）から高頻度にコマンドを連投するとマイコン側受信バッファが溢れ、パケット破損や処理詰まりの原因になります。コマンド送信には適切なインターバル（スロットリング）を設けてください。
 
 ---
 

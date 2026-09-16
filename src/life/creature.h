@@ -108,7 +108,9 @@ inline void creatureTick(Creature& c, uint32_t dt) {
   if (steps == 0) steps = 1;
   for (uint32_t i = 0; i < steps; i++) {
     c.age_sec += 30;
-    c.hunger = min(100, (int)c.hunger + 2);
+    // 老い (3日〜): 燃費悪化のみ。強制死はしない (お世話難化で代替。放置・病気では死ぬ)。
+    bool old = c.age_sec > 259200;
+    c.hunger = min(100, (int)c.hunger + (old ? 3 : 2));
     for (int k = 0; k < 3; k++) c.habit[k] = c.habit[k] > 8 ? c.habit[k] - 8 : 0;  // 飽きは6分で醒める
     bool night = creatureNight(c.age_sec);
     if (c.action == Action::SLEEP) {
@@ -131,14 +133,13 @@ inline void creatureTick(Creature& c, uint32_t dt) {
     }
     if (((c.age_sec / 30) % 2) == 0 && c.cleanliness > 0) c.cleanliness--;
     // 生死: 飢餓・衰弱で減り、満たされると回復。0で死 (M8で世代交代)。
-    // 老衰: 3日を過ぎると毎tick衰弱し、回復しない。死は次世代へ。
-    bool old = c.age_sec > 259200;
+    // 不潔 (<30) だと気が滅入る＋自然回復が止まる (掃除の意味)。
     if (c.hunger >= 95 || c.energy == 0) {
       if (c.health > 0) c.health--;
-    } else if (!old && c.hunger < 50 && c.happiness > 50 && c.health < 100) {
+    } else if (c.hunger < 50 && c.happiness > 50 && c.cleanliness >= 30 && c.health < 100) {
       c.health++;
     }
-    if (old && c.health > 0) c.health--;
+    if (c.cleanliness < 30 && c.happiness > 0) c.happiness--;
   }
 }
 

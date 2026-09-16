@@ -15,6 +15,7 @@ inline const char* feed(Creature& c) {
   c.hunger = c.hunger > 30 ? c.hunger - 30 : 0;
   c.happiness = min(100, (int)c.happiness + habGain(5, c.habit[0]));  // 飽きで効きが落ちる
   c.habit[0] = min(100, (int)c.habit[0] + 25);
+  c.cleanliness = c.cleanliness > 15 ? c.cleanliness - 15 : 0;  // 食ったら出す (うんちの種)
   c.action = Action::EAT;
   return "FEED_OK";
 }
@@ -26,6 +27,23 @@ inline const char* play(Creature& c) {
   c.energy -= 10;
   c.action = Action::PLAY;
   return "PLAY_OK";
+}
+
+// 掃除 (同時押し・CLEAN用)。綺麗ならSPOTLESSで何もしない (連打で稼げない)。
+inline const char* clean(Creature& c) {
+  if (c.cleanliness >= 100) return "SPOTLESS";
+  c.cleanliness = 100;
+  c.happiness = min(100, (int)c.happiness + 3);  // さっぱり
+  c.action = Action::IDLE;
+  return "CLEAN_OK";
+}
+
+// お薬 (シリアルCURE・PC専用。ボタン逼迫回避)。SICK圏外には効かない (チート防止)。
+inline const char* cure(Creature& c) {
+  if (c.health >= 50) return "NO_NEED";
+  c.health = min(100, (int)c.health + 30);
+  c.happiness = c.happiness > 5 ? c.happiness - 5 : 0;  // 苦い
+  return "CURE_OK";
 }
 
 // 各形態のトレーニング適性 [0]=最得意, [1]=第2適性 (0:INT, 1:AGGR, 2:CURIO, 3:SOC)
@@ -44,16 +62,62 @@ static const uint8_t MORPH_TRAIT_APTITUDE[12][2] = {
   {3, 2}   // 11: ほし (サンショウ)-> SOC, CURIO
 };
 
-// モンスターファーム2式トレーニング
+// トレーニング対象選択 (70%で最得意、30%で第2適性)。train()/inspect共用。
+inline uint8_t pickTrainTarget(const Creature& c) {
+  uint8_t raw = c.species_id % 12;
+  return ((esp_random() % 100) < 70) ? MORPH_TRAIT_APTITUDE[raw][0] : MORPH_TRAIT_APTITUDE[raw][1];
+}
+
+// 反応検査の等級: 0=PERFECT 1=GREAT 2=GOOD 3=FAIL 4=FLYING(お手つき)
+inline uint8_t gradeInspect(int dtMs, bool pressed) {
+  if (!pressed) return 3;
+  if (dtMs < 0) return 4;
+  if (dtMs <= 150) return 0;
+  if (dtMs <= 400) return 1;
+  if (dtMs <= 800) return 2;
+  return 3;
+}
+
+// 検査結果の適用 (TRAINと同一利得表。コスト支払い・過労ゲートは呼出側)。
+// PERFECTはGREAT上限値+王冠 (表示は呼出側がイベント名"TR:PERFECT!"で判定)。
+inline const char* applyInspect(Creature& c, uint8_t target, uint8_t grade) {
+  if (target > 3) target = 0;
+  if (grade == 4) {  // お手つきは失格 (やる気も少し削る)
+    c.happiness = c.happiness > 3 ? c.happiness - 3 : 0;
+    c.action = Action::IDLE;
+    return "TR:FLYING";
+  }
+  if (grade == 3) {
+    c.action = Action::IDLE;
+    return "TR:FAIL";
+  }
+  uint8_t gain = 0;
+  if (grade == 0) {
+    gain = 5;
+    c.happiness = min(100, (int)c.happiness + 15);
+  } else if (grade == 1) {
+    gain = 4 + (esp_random() % 2);  // +4〜5 (ダイスGREATと同一)
+    c.happiness = min(100, (int)c.happiness + 15);
+  } else {
+    gain = 2 + (esp_random() % 2);  // +2〜3 (ダイスSUCCESSと同一)
+  }
+  if (target == 0) c.intelligence = min(100, (int)c.intelligence + gain);
+  else if (target == 1) c.aggression = min(100, (int)c.aggression + gain);
+  else if (target == 2) c.curiosity = min(100, (int)c.curiosity + gain);
+  else if (target == 3) c.sociability = min(100, (int)c.sociability + gain);
+  c.habit[1] = min(100, (int)c.habit[1] + 20);  // 手遊びは飽きる (PLAY系)
+  c.action = Action::PLAY;  // 大喜び
+  return grade == 0 ? "TR:PERFECT!" : grade == 1 ? "TR:GREAT!" : "TR:SUCCESS";
+}
+
+// モンスターファーム2式トレーニング (ダイス自動。手動の検査ゲームはapplyInspect側)
 // targetTrait: -1=形態適性から自動, 0=INT, 1=AGGR, 2=CURIO, 3=SOC
 inline const char* train(Creature& c, int targetTrait = -1) {
-  uint8_t raw = c.species_id % 12;
   uint8_t target = 0;
   if (targetTrait >= 0 && targetTrait <= 3) {
     target = (uint8_t)targetTrait;
   } else {
-    // 70%で最得意、30%で第2適性
-    target = ((esp_random() % 100) < 70) ? MORPH_TRAIT_APTITUDE[raw][0] : MORPH_TRAIT_APTITUDE[raw][1];
+    target = pickTrainTarget(c);
   }
 
   const char* traitNames[] = {"INT", "AGGR", "CURIO", "SOC"};
