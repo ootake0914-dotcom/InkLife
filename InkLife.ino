@@ -1,6 +1,7 @@
 // Ink Life — E-Ink LoRa人工生命 (Milestone 9: 現象エンジン＋電波エントロピー遺伝＋デュアルコア)
 // FQBN: esp32:esp32:esp32s3:CDCOnBoot=cdc,USBMode=hwcdc,FlashSize=16M,PSRAM=opi,PartitionScheme=app3M_fat9M_16MB
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 #include "src/hardware/hal.h"
 #include "src/life/creature.h"
 #include "src/life/evo.h"
@@ -276,7 +277,10 @@ void runInspectGame() {
   // 離し待ち (長押しの指が残っていても誤爆しない)。ボタン固着時は3秒で打ち切る:
   // 以降の進行はBOOTのみ参照 (GO判定・お手つき) のためSIDE保持のままでも必ず終局し、
   // FWが待ちループで永久に固まる事故を防ぐ (テレメトリ停止・PCから復旧不能になる)
-  for (unsigned long rw = millis(); halLevel() && millis() - rw < 3000;) delay(10);
+  for (unsigned long rw = millis(); halLevel() && millis() - rw < 3000;) {
+    esp_task_wdt_reset();
+    delay(10);
+  }
   setEvent("TEST_START");
   stayDraw(false);
   // カウントダウン3拍＋ランダム間隔。GO前のBOOT押下はお手つきとして記録する。
@@ -285,6 +289,7 @@ void runInspectGame() {
   uint8_t lastCount = 4;
   bool flying = false;
   while (millis() - c0 < waitMs) {
+    esp_task_wdt_reset();
     unsigned long el = millis() - c0;
     if (el < 1800) {
       uint8_t count = (uint8_t)(3 - el / 600);  // 3,2,1
@@ -305,6 +310,7 @@ void runInspectGame() {
   bool pressed = false;
   long dt = 0;
   while (millis() - t0 < 2000) {
+    esp_task_wdt_reset();
     if (halButtons() & 1) { pressed = true; dt = (long)(millis() - t0); break; }
     delay(5);
   }
@@ -328,7 +334,7 @@ void runInspectGame() {
 inline void countNeglectTick() {
   if (rtcCre.hunger >= 95 && rtcCareMiss < 9999) rtcCareMiss++;
 }
-// 7200s跨ぎで進化判定。戻り値true=進化した (呼出側はfull描画すること)。
+// 幼生(1800s)跨ぎで進化判定。戻り値true=進化した (呼出側はfull描画すること)。
 // 知人の好感度はその場で数える (aff>=50=BONDED、aff<=-50=RIVAL)。
 bool maybeEvolve(uint32_t prevAge) {
   if (prevAge >= evo::LARVA_AGE_MAX || rtcCre.age_sec < evo::LARVA_AGE_MAX) return false;
@@ -782,10 +788,16 @@ void setup() {
       // 壁時計の復元 (TIMEが来なくても季節・昼夜が動くよう。前回保存値＋RTC経過)。
       // 電源断でRTCが死んでいたら経過0扱いで保存値のまま (TIME待ちで上書きされる)。
       if (savedUnix > 0) rtcUnix = savedUnix + clk::sleptSec(savedRtc, clk::rtcUs());
-      Serial.println("+WAITTIME 25s (or press button to skip)");
+      // TIME待ち。PC接続は通常数秒で完了するため10秒で十分 (旧25sは体感が悪かった)。
+      // 壁時計が新しければ(NVS保存から10分以内)不在計算はRTCで足りるので3秒に短縮。
+      bool clockFresh = (savedUnix > 0 && clk::sleptSec(savedRtc, clk::rtcUs()) < 600);
+      unsigned long waitMs = clockFresh ? 3000 : 10000;
+      Serial.print("+WAITTIME ");
+      Serial.print(waitMs / 1000);
+      Serial.println("s (or press button to skip)");
       unsigned long t0 = millis();
       uint32_t unixNow = 0;
-      while (millis() - t0 < 25000 && unixNow == 0) {
+      while (millis() - t0 < waitMs && unixNow == 0) {
         bool skipBtn = false;
         unixNow = pollTime(200, &skipBtn);
         if (skipBtn) {
@@ -826,7 +838,7 @@ void setup() {
   Serial.println(rtcBoots);
 
   // 不在分を30秒刻みで適用。関係も冷ます。昼夜を跨いだら遷移イベント。
-  // 不在中に7200sを跨いだら進化判定もここで (長期留守でも育ちは止めない)。
+  // 不在中に幼生境界(1800s)を跨いだら進化判定もここで (長期留守でも育ちは止めない)。
   // 壁時計は不在分だけ進める (TIME同期時は既に最新のため加算しない)。
   uint32_t ev0 = gEventSeq; Action act0 = rtcCre.action;  // 描画要否判定用スナップ
   bool nightBefore = effNight();
@@ -855,9 +867,30 @@ void setup() {
     careFeed();
   }
 
+  // パネル初期化の所要時間を計測 (初回フル描画8秒の内訳切り分け用)
+  unsigned long dispInit0 = micros();
   gDispOk = screen::init();
   Serial.print("+INK disp ");
-  Serial.println(gDispOk ? "ok" : "BUSY_STUCK");
+  Serial.print(gDispOk ? "ok" : "BUSY_STUCK");
+  Serial.print(" init_ms=");
+  Serial.println((micros() - dispInit0) / 1000UL);
+
+  // タスクWDT武装: loopタスクが20秒以上戻らない場合に自動再起動する。
+  // 無限ループ/固着で「テレメトリもPC復旧も不能」になる事故の最後の砦 (実機で発生済み)。
+  // 20秒はE-Inkフル描画8秒＋検査ゲーム最長16秒を含めても余裕がある値。
+  // 検査ゲーム等の長い待ちループは明示的にesp_task_wdt_reset()で餌をやること。
+  // 電池運用 (gStayAwake=false) では武装しない: deep sleep中はWDTが止まり誤爆リスクがあるため。
+  if (gStayAwake) {
+    esp_task_wdt_config_t wcfg = {};
+    wcfg.timeout_ms = 20000;
+    wcfg.idle_core_mask = 0;
+    wcfg.trigger_panic = true;
+    esp_err_t werr = esp_task_wdt_init(&wcfg);
+    if (werr == ESP_ERR_INVALID_STATE) werr = esp_task_wdt_reconfigure(&wcfg);
+    if (werr == ESP_OK) werr = esp_task_wdt_add(NULL);  // NULL=現在のタスク (loop)
+    Serial.print("+WDT ");
+    Serial.println(werr == ESP_OK ? "armed 20s" : "ARM_FAIL");
+  }
 
   // 無線 (4周回に1回): HELLO+STATUS送信→2秒受信窓→sleep。常時受信はしない。
   if (rtcBoots % 4 == 0) doRadioCycle();
@@ -936,6 +969,7 @@ static int hexParse(const char* s, uint8_t* out, int maxn) {
 
 void loop() {
   if (!gStayAwake) return;  // 通常運用ではここに来ない
+  esp_task_wdt_reset();     // loopタスクWDT (20秒。setupで武装)
   // 常時起動モード: 30秒tick＋ボタン＋TIME受付。USB抜去まで眠らない。
   uint8_t b = halButtons() | gPendBtn;  // 受信窓中の押下も拾う
   gPendBtn = 0;
@@ -1024,6 +1058,24 @@ void loop() {
           Serial.println("+TIME ok");
         } else {
           Serial.println("+TIME ng");
+        }
+      } else if (strcmp(p, "REBOOT") == 0) {
+        // 遠隔リカバリ (PCから固着・異常時の再起動)。戻らない
+        Serial.println("+REBOOT ok");
+        Serial.flush();
+        delay(80);
+        ESP.restart();
+      } else if (strcmp(p, "PET") == 0) {
+        // 撫で (PCのクリック)。30秒クールダウンで幸福+1。お世話カウンタには加点しない
+        // (連打で進化rankを稼げないように。PC側の見た目だけの+2は次+LIFEで消えていた)
+        static uint32_t lastPetMs = 0;
+        if (millis() - lastPetMs < 30000 && lastPetMs != 0) {
+          Serial.println("+PET wait");
+        } else {
+          lastPetMs = millis();
+          rtcCre.happiness = min(100, (int)rtcCre.happiness + 1);
+          setEvent("PET_OK");
+          Serial.println("+PET ok");
         }
       } else if (strcmp(p, "STARVE") == 0) {
         rtcCre.hunger = 100;
@@ -1268,7 +1320,7 @@ void loop() {
     }
     bool evolved = false;
     if (!reborn) {
-      // 7200s跨ぎで進化。転生と同様に残像なしのfullで迎える。
+      // 幼生境界(1800s)跨ぎで進化。転生と同様に残像なしのfullで迎える。
       if (maybeEvolve(preAge)) {
         stayDraw(true);
         evolved = true;

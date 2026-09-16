@@ -1,21 +1,24 @@
 #pragma once
 // life/evo.h — 進化判定。HW非依存の純粋関数 (FW/検定で共用)。
-// P0進化分岐: JUV(7200s)到達時に「お世話スコア×得意形質」で成体morphを決める。
+// P0進化分岐: 幼生(1800s=30分)到達時に「お世話スコア×得意形質」で成体morphを決める。
 // 血統 (variant=species/12) とfuseは維持し、見た目 (morph=species%12) だけ上書きする。
 // Creature本体・48Bパッキングには触らない。お世話カウンタは呼出側 (RTC+NVS) が持つ。
+// テンポ設計: 卵5分→幼生25分→進化30分 (旧 卵10分→幼生110分→進化2h)。判定窓が短いため
+// 閾値も縮小 (S>=15 A>=5 B>=-5)。tools/balance_sim.py evo-rank で分布を検証済み:
+// 放置=B / カジュアル=B / 普通=A / 熱心=S と4段階が機能する。
 #include <stdint.h>
 #include "creature.h"
 
 namespace evo {
 
-static const uint32_t EGG_AGE_MAX = 600;    // 未満はタマゴ (screen.hの表示境界と共有)
-static const uint32_t LARVA_AGE_MAX = 7200;  // 未満は幼生。以上で成体 (進化判定点)
+static const uint32_t EGG_AGE_MAX = 300;    // 未満はタマゴ (screen.hの表示境界と共有)
+static const uint32_t LARVA_AGE_MAX = 1800;  // 未満は幼生。以上で成体 (進化判定点)
 
 // お世話ランク: 0=S 1=A 2=B 3=C
 inline uint8_t rankOf(int score) {
-  if (score >= 30) return 0;
-  if (score >= 10) return 1;
-  if (score >= -10) return 2;
+  if (score >= 15) return 0;
+  if (score >= 5) return 1;
+  if (score >= -5) return 2;
   return 3;
 }
 

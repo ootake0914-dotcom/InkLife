@@ -593,20 +593,43 @@ class TournamentManager:
                 m.winner = self._simulate_quick_match(m.fighter_a, m.fighter_b)
                 m.completed = True
 
-        if self.matches[1].completed and self.matches[0].completed:
+        # 勝者伝播はスロット単位。旧実装は「同ブロックの2試合が揃うまで代入しない」ため、
+        # 決着済みの勝者が次ラウンドでTBDのままになりブラケットが未消化に見えていた
+        if self.matches[0].completed:
             self.matches[4].fighter_a = self.matches[0].winner
+        if self.matches[1].completed:
             self.matches[4].fighter_b = self.matches[1].winner
-
-        if self.matches[2].completed and self.matches[3].completed:
+        if self.matches[2].completed:
             self.matches[5].fighter_a = self.matches[2].winner
+        if self.matches[3].completed:
             self.matches[5].fighter_b = self.matches[3].winner
-            if not self.matches[5].is_player_involved and not self.matches[5].completed:
-                self.matches[5].winner = self._simulate_quick_match(self.matches[5].fighter_a, self.matches[5].fighter_b)
-                self.matches[5].completed = True
 
-        if self.matches[4].completed and self.matches[5].completed:
+        m4 = self.matches[4]
+        if (not m4.is_player_involved and not m4.completed and m4.fighter_a and m4.fighter_b):
+            # プレイヤーがQFで敗退した場合、SF4にも自分が居ないので自動消化する
+            # (旧実装はSF5しか自動消化せず、QF敗退時に決勝まで進まず優勝者が未確定だった)
+            m4.winner = self._simulate_quick_match(m4.fighter_a, m4.fighter_b)
+            m4.completed = True
+
+        m5 = self.matches[5]
+        if (not m5.is_player_involved and not m5.completed and m5.fighter_a and m5.fighter_b):
+            m5.winner = self._simulate_quick_match(m5.fighter_a, m5.fighter_b)
+            m5.completed = True
+
+        if self.matches[4].completed:
             self.matches[6].fighter_a = self.matches[4].winner
+        if self.matches[5].completed:
             self.matches[6].fighter_b = self.matches[5].winner
+
+        # プレイヤー敗退で決勝に自分が居ない場合は自動消化して優勝者を確定する。
+        # 旧実装は未消化のままになり、victory画面が "ARENA CHAMPION: UNKNOWN" になっていた
+        m6 = self.matches[6]
+        if (not m6.is_player_involved and not m6.completed and m6.fighter_a and m6.fighter_b):
+            m6.winner = self._simulate_quick_match(m6.fighter_a, m6.fighter_b)
+            m6.completed = True
+            self.is_tournament_over = True
+            self.champion = m6.winner
+            self.player_won = (self.champion == self.my_fighter)
 
     def get_next_player_match(self) -> Optional[Match]:
         if self.player_eliminated or self.is_tournament_over:
@@ -701,6 +724,7 @@ class TournamentUI:
         self.btn_evade_card = rl.Rectangle(680, 655, 160, 80)
         self.btn_auto_toggle = rl.Rectangle(860, 670, 170, 42)
         self.btn_return_farm = rl.Rectangle(460, 640, 360, 52)
+        self.btn_abandon = rl.Rectangle(40, 690, 300, 44)  # ブラケット画面: 途中放棄して農場へ
 
         self.mgr.resolve_background_matches()
 
@@ -732,6 +756,15 @@ class TournamentUI:
         mouse_clicked = rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT)
 
         if self.phase == TournamentPhase.BRACKET:
+            # 途中放棄 (旧: ブラケット画面に出口が無く、優勝/敗退まで抜けられなかった)
+            if rl.is_key_pressed(rl.KEY_ESCAPE):
+                self.sound.play("click")
+                self.should_exit = True
+                return False
+            if mouse_clicked and rl.check_collision_point_rec(mouse_pos, self.btn_abandon):
+                self.sound.play("click")
+                self.should_exit = True
+                return False
             enter_clicked = mouse_clicked and rl.check_collision_point_rec(mouse_pos, self.btn_enter_arena)
             if rl.is_key_pressed(rl.KEY_SPACE) or rl.is_key_pressed(rl.KEY_ENTER) or enter_clicked:
                 self.sound.play("click")
@@ -898,6 +931,16 @@ class TournamentUI:
         ty = int(self.btn_enter_arena.y + 16)
         rl.draw_text(enter_lbl, tx, ty, 18, rl.Color(255, 220, 60, 255) if hover else rl.WHITE)
 
+        # 途中放棄ボタン (ESCでも可)
+        hover_ab = rl.check_collision_point_rec(mouse_pos, self.btn_abandon)
+        rl.draw_rectangle_rounded(self.btn_abandon, 0.25, 4,
+                                  rl.Color(60, 42, 42, 255) if hover_ab else rl.Color(38, 30, 34, 255))
+        rl.draw_rectangle_rounded_lines(self.btn_abandon, 0.25, 4,
+                                        rl.Color(255, 150, 120, 255) if hover_ab else rl.Color(90, 60, 66, 255))
+        ab_lbl = "<< ABANDON / RETURN TO TERRARIUM  [ESC] <<"
+        rl.draw_text(ab_lbl, int(self.btn_abandon.x + 14), int(self.btn_abandon.y + 14), 13,
+                     rl.Color(255, 190, 170, 255) if hover_ab else rl.Color(180, 150, 150, 255))
+
     def _draw_match_box(self, match: Match, x: int, y: int, bw: int, bh: int, is_final: bool = False):
         bg_col = rl.Color(28, 36, 50, 255)
         border_col = rl.Color(255, 200, 50, 255) if match.is_player_involved else rl.Color(50, 65, 88, 255)
@@ -1003,13 +1046,11 @@ class TournamentUI:
         rl.draw_circle_3d(rl.Vector3(pos_a.x, 0.038, 0.0), shadow_a_rad, rl.Vector3(1, 0, 0), 90.0, rl.Color(12, 16, 24, 180))
         rl.draw_circle_3d(rl.Vector3(pos_b.x, 0.038, 0.0), shadow_b_rad, rl.Vector3(1, 0, 0), 90.0, rl.Color(12, 16, 24, 180))
 
-        # 4. Chimera 3D Voxel Models (Facing each other: A -> 90 deg, B -> -90 deg)
-        rot_a = 90.0
-        rot_b = -90.0
-        if self.engine.a.fstate == FighterState.KO:
-            rot_a = 90.0
-        if self.engine.b.fstate == FighterState.KO:
-            rot_b = -90.0
+        # 4. Chimera 3D Voxel Models (斜め向内で対峙。正面±28度)
+        # ボクセル素体は96x96アートのレリーフなので、旧実装の±90度は真横=薄い板に見えていた。
+        # 正面を保ったまま内側へ振る (farm側の rot_y も±12度以内で同思想)
+        rot_a = 28.0
+        rot_b = -28.0
 
         self.model_a.draw(
             pos_a, scale=0.92, rot_y=rot_a, breathe=self.anim_t,

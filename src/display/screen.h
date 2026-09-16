@@ -171,9 +171,10 @@ static const unsigned char* const MORPH_IDLE_XBM[12] = {
   ink_m11_idle_xbm,  // 11: ほし (独立)
 };
 
-// 成長サイズ: 64px(誕生)→96px(約3時間で成体)。連続変化で有機的に育つ。
+// 成長サイズ: 64px(誕生)→96px(約32分で成体=進化とほぼ同時にMAX)。連続変化で有機的に育つ。
+// テンポ圧縮に合わせ 270s/px → 60s/px (進化30分の時点で94px。以後も僅かに育つ)
 inline int growthSize(uint32_t age_sec) {
-  uint32_t s = 64 + age_sec / 270;  // 270秒で1px成長
+  uint32_t s = 64 + age_sec / 60;  // 60秒で1px成長
   if (s > 96) s = 96;
   return (int)s;
 }
@@ -338,9 +339,10 @@ inline bool isEggStage(uint32_t age_sec) { return age_sec < evo::EGG_AGE_MAX; }
 inline bool isLarvaStage(uint32_t age_sec) { return age_sec >= evo::EGG_AGE_MAX && age_sec < evo::LARVA_AGE_MAX; }
 
 // タマゴ3段階 (パラパラ孵化用に3等分。crack/hatchはidleと輪郭一致がマスタ約束)
+// 卵300s (EGG_AGE_MAX) の3等分: 100s毎。境界は表示hash (/100) と1:1
 inline const unsigned char* eggArt(uint32_t age_sec) {
-  if (age_sec < 200) return ink_egg_idle_xbm;
-  if (age_sec < 400) return ink_egg_crack_xbm;
+  if (age_sec < 100) return ink_egg_idle_xbm;
+  if (age_sec < 200) return ink_egg_crack_xbm;
   return ink_egg_hatch_xbm;
 }
 // 幼生5感情 (getMorphActionArtと同一の優先度: 睡眠>食事>喜び>悲しみ)
@@ -411,24 +413,47 @@ inline void sprite(const Creature& c, Mood m, int ox, int oy, bool crown = false
       }
     }
   };
+  // シルエット型抜き白ハロー付きオーバーレイ。矩形ハローはE-Inkで白い箱に見えるため、
+  // 黒画素をhl px膨らませた白を先に敷き、その後に黒を載せる (成長追従・散布無し)。
+  // 2パス必須: 画素ごとに白→黒を混ぜると後続の白が先行の黒を消す。
+  auto overlay96sHalo = [&](const unsigned char* xbm, int k, int hl) {
+    for (int pass = 0; pass < 2; pass++) {
+      for (int y = 0; y < 96; y++) {
+        int row = y * 12;
+        for (int x = 0; x < 96; x++) {
+          if (!(xbm[row + (x >> 3)] & (1 << (x & 7)))) continue;
+          int sx = 48 + (x - 48) * k / 100;
+          int sy = 48 + (y - 48) * k / 100;
+          int dx = bx + SC(sx), dy = by + SC(sy);
+          if (pass == 0) {
+            for (int oy = -hl; oy <= hl; oy++)
+              for (int ox = -hl; ox <= hl; ox++)
+                disp.drawPixel(dx + ox, dy + oy, GxEPD_WHITE);
+          } else {
+            disp.drawPixel(dx, dy, GxEPD_BLACK);
+          }
+        }
+      }
+    }
+  };
   // イベント重ねは最前面 (fuseのマスク消去に埋もれないよう)。順序: うんち→王冠→帽子。
   // 頭物は競合したら王冠優先 (実績が季節に勝つ)。幼生の頭物は65%に縮小。
   auto eventOverlays = [&]() {
 #ifdef INK_HAS_POOP
-    // うんちは白抜きハロー付き (尻尾・装備に埋もれず前景に見せる。bbox+2px)。
-    if (c.cleanliness < 50) {
-      disp.fillRect(bx + SC(64), by + SC(71), max(1, SC(20)), max(1, SC(18)), GxEPD_WHITE);
-      overlay96s(ink_poop_1_xbm, 100);
-    }
-    if (c.cleanliness < 25) {
-      disp.fillRect(bx + SC(57), by + SC(74), max(1, SC(20)), max(1, SC(18)), GxEPD_WHITE);
-      overlay96s(ink_poop_2_xbm, 100);
-    }
+    // うんちは型抜きハロー付き (白い箱に見えず、尻尾・装備に埋もれず前景に見える)
+    if (c.cleanliness < 50) overlay96sHalo(ink_poop_1_xbm, 100, max(1, SC(2)));
+    if (c.cleanliness < 25) overlay96sHalo(ink_poop_2_xbm, 100, max(1, SC(2)));
 #else
     if (c.cleanliness < 50) dot(78, 84, 6, 5);
     if (c.cleanliness < 25) dot(68, 88, 5, 4);
 #endif
     int hk = isLarvaStage(c.age_sec) ? 65 : 100;
+    // 長老マーク (12h〜): 頭上の小さな星屑2つ。専用アート無しで「育った感」を出す
+    // (STG表示はELDERになるが絵が同じため、見た目の変化が無いという指摘への対応)
+    if (c.age_sec >= 43200) {
+      dot(18, 10, 5, 1); dot(16, 8, 1, 5);
+      dot(74, 6, 5, 1);  dot(76, 4, 1, 5);
+    }
     // 王冠 (検査PERFECTの実績。季節帽子に優先。実績が季節に勝つ)
 #ifdef INK_HAS_CROWN
     if (crown) overlay96s(art_test_crown_xbm, hk);
@@ -609,9 +634,11 @@ inline void morphTag(const Creature& c, char* b) {  // b[12]。"WHISKER-10"(10�
   snprintf(b, 12, "%s-%02d", morphName(c.species_id), c.species_id % 12);
 }
 
+// STG表示の成長段階。境界はevo定数と共有 (卵300s/幼生1800s/成体12h/長老)。
+// 旧: 卵をLARVAと誤記していた (morphTagのEGGと矛盾) → 卵はEGGに統一
 inline const char* stageName(uint32_t age_sec) {
-  if (age_sec < 600) return "LARVA";
-  if (age_sec < 7200) return "JUV";
+  if (age_sec < evo::EGG_AGE_MAX) return "EGG";
+  if (age_sec < evo::LARVA_AGE_MAX) return "JUV";
   if (age_sec < 43200) return "ADULT";
   return "ELDER";
 }
@@ -677,9 +704,9 @@ inline uint32_t dispHash(const Creature& c, const char* event, uint8_t friends) 
   mix(c.health); mix((uint32_t)(100 - c.hunger)); mix(c.energy); mix(c.happiness);
   mix(c.cleanliness / 25);  // うんちマーカー帯 (50/25境界と1:1。75帯は冗長だが無害)
   mix(c.age_sec / 60);
-  mix(c.age_sec / 270);  // growthSize段差 (分丸めと非同期のため明示)
+  mix(c.age_sec / 60);  // 成長段差 (growthSizeの60s/pxと1:1)
   mix(isEggStage(c.age_sec) ? 1 : isLarvaStage(c.age_sec) ? 2 : 0);  // 早期形態素体
-  mix(c.age_sec / 200);  // タマゴ3段階境界 (eggArtの200/400s切替と1:1)
+  mix(c.age_sec / 100);  // タマゴ3段階境界 (eggArtの100/200s切替と1:1)
   mix((uint32_t)c.action);
   mix((uint32_t)creatureMood(c));
   mix(c.intelligence); mix(c.curiosity); mix(c.aggression); mix(c.sociability);

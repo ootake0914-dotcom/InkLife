@@ -26,9 +26,9 @@ import pyray as rl
 from inkparser import (
     CreatureState, InkProtocolParser, MORPH_NAMES, GEAR_NAMES, GEAR_NAMES_EN,
     stat_rank, condition_label, MORPH_TRAIT_APTITUDE, FW_STAT_TO_DISPLAY,
-    hab_gain
+    hab_gain, GROWTH_SEC_PER_PX, EVO_TABLE, EVO_RANK_NAMES, EVO_TRAIT_ORDER
 )
-from voxel_art import ChimeraVoxelModel
+from voxel_art import ChimeraVoxelModel, ART_DB
 from virtual_eink import VirtualEInk
 from sound_effects import SoundManager
 from tournament import Fighter, TournamentManager, TournamentUI
@@ -374,7 +374,15 @@ class SerialWorker:
                                 break
                             line = line_bytes.decode("utf-8", errors="replace").strip()
                             if line:
-                                self._add_log(line)
+                                # FIELDBは12行/分でログを埋めてイベントを押し流すため畳む
+                                # (盤面はE-Inkミニ窓とラボのAct/Symに反映済み。解析はINK_FELDB=1で生表示)
+                                if line.startswith("+FIELDB "):
+                                    if os.environ.get("INK_FELDB") == "1":
+                                        self._add_log(line)
+                                    elif line[8:9] == "0":
+                                        self._add_log("+FIELDB x12 (board updated)")
+                                else:
+                                    self._add_log(line)
                                 with self.state_lock:
                                     r = self.parser.parse_line(line)
                                     if r and r.get("type") == "event":
@@ -392,6 +400,69 @@ class SerialWorker:
                     time.sleep(1.0)
 
             time.sleep(0.01)
+
+def draw_morph_dex(state: CreatureState):
+    """形態図鑑オーバーレイ (Mキー)。12形態のアート・名前・得意形質と進化表を一覧する。
+    進化先の見通しが立つので「あと30分で何になるか」の楽しみが増える (アートはFWと同一XBM)"""
+    rl.draw_rectangle(0, 0, WIN_W, WIN_H, rl.Color(8, 10, 16, 236))
+    rl.draw_text("MORPH ENCYCLOPEDIA", 24, 12, 20, COL_ACCENT)
+    rl.draw_text("M: close   |   gold frame = current form   |   A/B = training aptitude",
+                 24, 38, 11, COL_TXT_DIM)
+
+    cur_raw = state.raw_morph
+    cw, ch = 150, 196
+    x0, y0 = 24, 60
+    for i in range(12):
+        cx = x0 + (i % 4) * 156
+        cy = y0 + (i // 4) * 204
+        is_cur = (i == cur_raw)
+        rl.draw_rectangle_rounded(rl.Rectangle(cx, cy, cw, ch), 0.08, 4,
+                                  rl.Color(30, 42, 60, 255) if is_cur else rl.Color(17, 23, 33, 255))
+        rl.draw_rectangle_rounded_lines(rl.Rectangle(cx, cy, cw, ch), 0.08, 4,
+                                        rl.Color(255, 215, 0, 255) if is_cur else rl.Color(50, 65, 90, 255))
+        px = _dex_pixels(f"ink_m{i:02d}_idle")
+        sc = 84.0 / 96.0
+        ax = cx + (cw - 84) / 2
+        ay = cy + 6
+        col = rl.Color(230, 238, 248, 255)
+        for (dx, dy) in px:
+            rl.draw_rectangle(int(ax + dx * sc), int(ay + dy * sc), 1, 1, col)
+        nm = MORPH_NAMES.get(i, "?")
+        rl.draw_text(f"{i:02d} {nm}", int(cx + 8), int(cy + 98), 13,
+                     rl.Color(255, 215, 0, 255) if is_cur else COL_TXT_MAIN)
+        apt = MORPH_TRAIT_APTITUDE[i]
+        d0 = FW_STAT_TO_DISPLAY[EVO_TRAIT_ORDER[apt[0]]]
+        d1 = FW_STAT_TO_DISPLAY[EVO_TRAIT_ORDER[apt[1]]]
+        rl.draw_text(f"A:{d0}  B:{d1}", int(cx + 8), int(cy + 118), 11, COL_ACCENT)
+
+    # 進化表 (rank x 得意形質 -> morph)
+    ty = y0 + 3 * 204 + 4
+    rl.draw_text("EVOLUTION TABLE  (care rank x dominant trait)", 24, ty, 13, COL_ACCENT_AMB)
+    for r in range(4):
+        row = EVO_TABLE[r]
+        names = "  ".join(f"{EVO_TRAIT_ORDER[t][:3]}:{MORPH_NAMES.get(row[t], '?')[:7]}" for t in range(4))
+        rl.draw_text(f"{EVO_RANK_NAMES[r]}  {names}", 24, ty + 20 + r * 16, 12,
+                     rl.Color(255, 215, 0, 255) if r == 0 else COL_TXT_MAIN)
+
+
+DEX_PIXEL_CACHE = {}
+
+
+def _dex_pixels(frame_name: str):
+    """XBMフレームの黒画素リスト (初回走査をキャッシュ)"""
+    px = DEX_PIXEL_CACHE.get(frame_name)
+    if px is None:
+        b = ART_DB.get_frame_bytes(frame_name)
+        px = []
+        if b and len(b) >= 1152:
+            for y in range(96):
+                row = y * 12
+                for x in range(96):
+                    if (b[row + (x >> 3)] >> (x & 7)) & 1:
+                        px.append((x, y))
+        DEX_PIXEL_CACHE[frame_name] = px
+    return px
+
 
 def draw_mf2_status_panel(state: CreatureState, x: int, y: int):
     """左上 3Dテラリウム内 MF2能力値パネル (POW, INT, SPD, SKI & ランク & コンディション)"""
@@ -558,6 +629,10 @@ def main():
     bubble_alpha = 1.0
     # 反応速度検査ミニゲームの状態 (None or dict)。G開始・SPACE回答。
     inspect_game = None
+    # 形態図鑑オーバーレイ (Mトグル)
+    show_dex = False
+    # REBORN二度押し確認 (誤クリックで世代が飛ぶのを防ぐ)
+    reborn_armed_until = 0.0
     # オフライン生理tick用アキュムレータ (1実秒=30ゲーム秒)
     offline_acc = 0.0
 
@@ -691,12 +766,29 @@ void main() {
                     state.speech_timer = 5.0
                 elif etype == "event":
                     evt = ev.get("event", "")
-                    if evt == "OHAYO":
-                        sound_mgr.play("ohayo_birds")
-                    elif evt in ("CLEAN_OK", "SPOTLESS"):
-                        sound_mgr.play("clean_scrub")
-                    elif evt == "CURE_OK":
-                        sound_mgr.play("cure_chime")
+                    # イベント→効果音 (旧: OHAYO/掃除/薬の3種のみで残りは無音だった)
+                    _sfx = {
+                        "FEED_OK": "eat_crunch", "STUFFED": "eat_crunch",
+                        "PLAY_OK": "play_chirp",
+                        "CLEAN_OK": "clean_scrub", "SPOTLESS": "clean_scrub",
+                        "CURE_OK": "cure_chime",
+                        "OHAYO": "ohayo_birds",
+                        "ENTER_REST": "sleep_soft",
+                        "WAKE_OK": "wake_yawn",
+                        "FATIGUE": "fatigue_thud",
+                        "OVERWORK": "overwork_alarm",
+                        "BONDED": "bond_twinkle",
+                        "RIVAL": "rival_growl",
+                        "PEER_FOUND": "peer_ping",
+                        "FOOD_TX": "packet_zip", "FOOD_RX": "packet_zip",
+                        "COMBAT_WIN": "combat_hit", "COMBAT_LOSS": "combat_hit",
+                        "TRADE_OK": "trade_swap", "TRADE_REFUSE": "trade_swap",
+                        "BIRTH_RX": "peer_fanfare", "EVOLVE_RX": "peer_fanfare",
+                        "GETWELL_RX": "heal_bell",
+                        "NIGHTFALL": "night_fall", "DAYBREAK": "day_break",
+                    }.get(evt)
+                    if _sfx:
+                        sound_mgr.play(_sfx)
 
         train_cutin.update(dt)
 
@@ -713,6 +805,8 @@ void main() {
 
         # マウス入力 & 3D カメラ制御
         mouse_pos = rl.get_mouse_position()
+        if show_dex:
+            mouse_pos = rl.Vector2(-9999.0, -9999.0)  # 図鑑表示中はUI入力を無効化
         in_3d_area = (mouse_pos.x < 650)  # 左側 3D 領域
 
         # 撫で判定は上部UI(タイトル/MF2パネル/吹き出し/カットイン帯 y<270)を除外。
@@ -725,9 +819,10 @@ void main() {
             if pet_zone:
                 # キメラクリック判定 (跳ねるリアクション)
                 click_bounce = 1.0
+                # FW側で幸福+1 (30秒クールダウン)。旧: PCローカル+2は次の+LIFEで上書きされ消えていた
+                serial_worker.send("PET")
                 with serial_worker.state_lock:
                     state.speech_bubble = "*purr* So happy to see you!"
-                    state.happiness = min(100, state.happiness + 2)
                     state.speech_timer = 3.5
 
         if rl.is_mouse_button_released(rl.MOUSE_BUTTON_LEFT):
@@ -751,9 +846,15 @@ void main() {
         cam.position.z = math.cos(cam_angle) * math.cos(cam_pitch) * cam_dist
         cam.target = rl.Vector3(0.0, 0.75, 0.0)
 
+        # 形態図鑑 (M: 12形態のアート・得意形質・進化表。開いている間は入力を殺す)
+        if rl.is_key_pressed(rl.GLFW_KEY_M):
+            show_dex = not show_dex
+            mouse_dragging = False
+            sound_mgr.play("click")
+
         # 反応速度検査ミニゲーム (G開始・SPACE回答。FW runInspectGameと同一経済)
         # E-Ink実機はLED合図、PCは画面カウントダウン。GO前のSPACEはお手つき失格。
-        if rl.is_key_pressed(rl.GLFW_KEY_G) and inspect_game is None:
+        if rl.is_key_pressed(rl.GLFW_KEY_G) and inspect_game is None and not show_dex:
             sound_mgr.play("click")
             inspect_game = {"phase": "COUNT", "t0": sim_time,
                             "go_at": sim_time + 1.8 + random.uniform(0.5, 1.5),
@@ -946,13 +1047,20 @@ void main() {
 
         if rl.check_collision_point_rec(mouse_pos, btn_reborn) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
-            serial_worker.send("REBORN")
-            state.speech_bubble = "Rebirth command sent! New generation awaits..."
-            state.speech_timer = 3.5
-            if not serial_worker.connected:
-                with serial_worker.state_lock:
-                    offline_rebirth(state)
-                    state.speech_bubble = f"Reborn as Gen {state.generation}! (offline sim)"
+            if sim_time < reborn_armed_until:
+                # 二度押しで確定 (旧: ワンクリック即REBORNで誤爆すると世代が飛んでいた)
+                reborn_armed_until = 0.0
+                serial_worker.send("REBORN")
+                state.speech_bubble = "Rebirth command sent! New generation awaits..."
+                state.speech_timer = 3.5
+                if not serial_worker.connected:
+                    with serial_worker.state_lock:
+                        offline_rebirth(state)
+                        state.speech_bubble = f"Reborn as Gen {state.generation}! (offline sim)"
+            else:
+                reborn_armed_until = sim_time + 3.0
+                state.speech_bubble = "REBORN: click again within 3s to confirm"
+                state.speech_timer = 3.0
 
         if rl.check_collision_point_rec(mouse_pos, btn_photo) and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT):
             sound_mgr.play("click")
@@ -1003,7 +1111,7 @@ void main() {
 
             # バーチャル E-Ink の更新 (内容変化時のみ再構築＋転送。盤面到着も含む)
             # FW dispHash相当: 分丸め・成長段で秒ゆらぎ再構築を抑止、4形質でTRAIN直後 staleを防止
-            ekey = (state.age_sec // 60, state.age_sec // 270, state.action, state.mood,
+            ekey = (state.age_sec // 60, state.age_sec // GROWTH_SEC_PER_PX, state.action, state.mood,
                     tuple(state.fuse), state.last_event, len(state.peers),
                     state.health, state.hunger, state.energy, state.happiness,
                     state.intelligence, state.curiosity, state.aggression,
@@ -1293,7 +1401,8 @@ void main() {
             rl.draw_text(label, tx, ty, 12, col_acc if hover else COL_TXT_MAIN)
 
         draw_button(btn_train, "TRAIN", rl.Color(255, 180, 50, 255))
-        draw_button(btn_reborn, "REBORN", rl.Color(255, 110, 220, 255))
+        draw_button(btn_reborn, "CONFIRM?" if sim_time < reborn_armed_until else "REBORN",
+                    rl.Color(255, 110, 220, 255))
         draw_button(btn_photo, "SNAPSHOT", COL_ACCENT_AMB)
         draw_button(btn_tourney, "TOURNEY", rl.Color(255, 215, 0, 255))
         draw_button(btn_clean, "CLEAN", rl.Color(140, 220, 255, 255))
@@ -1328,6 +1437,10 @@ void main() {
                 g = ig.get("result", 3)
                 rl.draw_text(names[g] if 0 <= g <= 4 else "FAIL",
                              cx - 110, cy - 50, 64, rl.Color(255, 215, 0, 255))
+
+        # 形態図鑑オーバーレイ (Mトグル) は最前面
+        if show_dex:
+            draw_morph_dex(state)
 
         rl.end_drawing()
 

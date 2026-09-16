@@ -226,6 +226,97 @@ class SoundManager:
             (1046.50, 320, 'pulse', 0.90),
         ]))
 
+        # 22. もぐもぐ (FEED_OK: 低めの粒状パルス4連)
+        self._register("eat_crunch", _synth_wav([
+            (180, 45, 'noise', 0.55),
+            (150, 45, 'noise', 0.50),
+            (200, 45, 'noise', 0.55),
+            (140, 70, 'noise', 0.45),
+        ]))
+
+        # 23. うれしい鳴き (PLAY_OK: 上昇2連チャープ)
+        self._register("play_chirp", _synth_wav([
+            ((700, 1100), 90, 'pulse', 0.55),
+            ((900, 1500), 120, 'pulse', 0.60),
+        ]))
+
+        # 24. すやすや (ENTER_REST: 柔らかい下降2音)
+        self._register("sleep_soft", _synth_wav([
+            (523.25, 200, 'triangle', 0.45),
+            (392.00, 320, 'triangle', 0.40),
+        ]))
+
+        # 25. おはよ (WAKE_OK: 短い上昇3音)
+        self._register("wake_yawn", _synth_wav([
+            (440.00, 90, 'triangle', 0.50),
+            (554.37, 90, 'triangle', 0.55),
+            (659.25, 160, 'triangle', 0.60),
+        ]))
+
+        # 26. バタン (FATIGUE: 脱力して倒れる低音)
+        self._register("fatigue_thud", _synth_wav([
+            ((320, 90), 220, 'square', 0.70),
+            (90, 200, 'noise', 0.65),
+        ]))
+
+        # 27. きらきら (BONDED: 高音の粒3連)
+        self._register("bond_twinkle", _synth_wav([
+            (1318.51, 70, 'pulse', 0.45),
+            (1567.98, 70, 'pulse', 0.50),
+            (2093.00, 160, 'pulse', 0.55),
+        ]))
+
+        # 28. うなる (RIVAL: 低くざらつく2連)
+        self._register("rival_growl", _synth_wav([
+            (160, 160, 'noise', 0.60),
+            (110, 240, 'square', 0.65),
+        ]))
+
+        # 29. ピコン (PEER_FOUND: レーダー反応)
+        self._register("peer_ping", _synth_wav([
+            (1046.50, 60, 'pulse', 0.50),
+            (1568.00, 120, 'pulse', 0.45),
+        ]))
+
+        # 30. シュルッ (FOOD_TX/FOOD_RX: パケット送受信)
+        self._register("packet_zip", _synth_wav([
+            ((1800, 600), 160, 'triangle', 0.45),
+        ]))
+
+        # 31. ドン (COMBAT_WIN/LOSS: 決着の一撃)
+        self._register("combat_hit", _synth_wav([
+            (200, 80, 'noise', 0.85),
+            ((260, 80), 240, 'square', 0.70),
+        ]))
+
+        # 32. ポン (TRADE_OK: 交換成立)
+        self._register("trade_swap", _synth_wav([
+            (880.00, 70, 'pulse', 0.50),
+            (1174.66, 140, 'pulse', 0.55),
+        ]))
+
+        # 33. ファンファーレ小 (BIRTH_RX/EVOLVE_RX: 仲間の祝事)
+        self._register("peer_fanfare", _synth_wav([
+            (659.25, 90, 'square', 0.60),
+            (880.00, 90, 'square', 0.65),
+            (1318.51, 220, 'pulse', 0.70),
+        ]))
+
+        # 34. ちりん (GETWELL_RX: 回復の鈴)
+        self._register("heal_bell", _synth_wav([
+            (1760.00, 140, 'triangle', 0.50),
+            (2093.00, 260, 'triangle', 0.45),
+        ]))
+
+        # 35. 夜のしじま (NIGHTFALL) / 36. 朝の光 (DAYBREAK)
+        self._register("night_fall", _synth_wav([
+            ((600, 300), 420, 'triangle', 0.45),
+        ]))
+        self._register("day_break", _synth_wav([
+            ((400, 900), 300, 'triangle', 0.50),
+            (1046.50, 200, 'pulse', 0.45),
+        ]))
+
     def play(self, name: str):
         """サウンドの再生"""
         if not self.enabled or not self.audio_ready:

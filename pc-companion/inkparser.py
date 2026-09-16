@@ -13,6 +13,22 @@ from typing import Dict, List, Optional, Any, Tuple
 # ANCHOR_BASE_MAP が装備アンカー & fuse優劣の正規マップ (実機正)。
 # 旧MORPH_5_MAPはFW削除に追随し撤去済み (値が異なり使用禁止だったもの)。
 ANCHOR_BASE_MAP = [0, 1, 2, 1, 4, 2, 1, 7, 0, 4, 10, 0]  # FW ANCHOR_BASE_MAP そのまま
+
+# 成長段階の境界 (FW life/evo.h と1:1。ここが唯一の定義元でPC各所はこれを参照する)
+EGG_AGE_MAX = 300     # 未満はタマゴ
+LARVA_AGE_MAX = 1800  # 未満は幼生。以上で成体 (=進化判定点)
+GROWTH_SEC_PER_PX = 60  # FW growthSize: 64px + age/60 → 96px (旧270)
+
+# 進化テーブル (FW life/evo.h EVO_TABLE と1:1)。[rank][trait] -> morph
+# rank 0=S 1=A 2=B 3=C / trait 0=INT 1=AGGR 2=CURIO 3=SOC
+EVO_TABLE = [
+    [5, 1, 10, 2],
+    [8, 4, 6, 7],
+    [0, 9, 11, 0],
+    [3, 3, 9, 3],
+]
+EVO_RANK_NAMES = "SABC"
+EVO_TRAIT_ORDER = ["INT", "AGGR", "CURIO", "SOC"]
 MORPH_NAMES = {0: "SLIME", 1: "DRAGON", 2: "SHIBA", 3: "SPINE", 4: "CAT", 5: "HALO", 6: "FIN", 7: "FROG", 8: "SPIRAL", 9: "LEG", 10: "WHISKER", 11: "STAR"}
 GEAR_NAMES = [
     "まる", "つの", "みみ", "とげ", "しま", "わっか",
@@ -265,9 +281,9 @@ class CreatureState:
 
     @property
     def stage_name(self) -> str:
-        if self.age_sec < 600:
-            return "LARVA"
-        if self.age_sec < 7200:
+        if self.age_sec < EGG_AGE_MAX:
+            return "EGG"
+        if self.age_sec < LARVA_AGE_MAX:
             return "JUV"
         if self.age_sec < 43200:
             return "ADULT"

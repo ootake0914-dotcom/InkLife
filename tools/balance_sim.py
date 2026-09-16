@@ -16,6 +16,7 @@ C++整数除算の切り捨て (負数は0方向) まで合わせている。乱
   python tools/balance_sim.py grind [--sessions 200 --seed 1]
   python tools/balance_sim.py fight [--trials 20000 --seed 1]
   python tools/balance_sim.py life [--days 3 --seed 1]
+  python tools/balance_sim.py evo-rank [--sessions 40 --seed 1]
   python tools/balance_sim.py all
 """
 from __future__ import annotations
@@ -139,10 +140,13 @@ def creature_tick(c: Creature, dt: int = 30) -> None:
         if c.hu >= 95 or c.en == 0:
             if c.hp > 0:
                 c.hp -= 1
-        elif not old and c.hu < 50 and c.ha > 50 and c.hp < 100:
+        elif c.hu < 50 and c.ha > 50 and c.cl >= 30 and c.hp < 100:
             c.hp += 1
-        if old and c.hp > 0:
-            c.hp -= 1
+        if c.cl < 30 and c.ha > 0:
+            c.ha -= 1
+        # 老いは燃費悪化のみ (FW準拠: 強制死はしない。hunger上昇を+3に)
+        if old and c.hu < 100:
+            c.hu = min(100, c.hu + 1)
 
 
 # --- ai.h ---
@@ -209,8 +213,173 @@ def ui_feed(c: Creature) -> str:
     c.hu = c.hu - 30 if c.hu > 30 else 0
     c.ha = min(100, c.ha + hab_gain(5, c.habit[0]))
     c.habit[0] = min(100, c.habit[0] + 25)
+    c.cl = c.cl - 15 if c.cl > 15 else 0  # FW準拠: 食ったら出す
     c.action = "EAT"
     return "FEED_OK"
+
+
+def ui_clean(c: Creature) -> str:
+    """FW ui::clean (同時押しCLEAN / PC CLEANボタン)"""
+    if c.cl >= 100:
+        return "SPOTLESS"
+    c.cl = 100
+    c.ha = min(100, c.ha + 3)
+    c.action = "IDLE"
+    return "CLEAN_OK"
+
+
+def ui_inspect(c: Creature, rng, skill: str) -> tuple:
+    """検査ゲーム適用 (FW ui::gradeInspect/applyInspect + 呼出側コスト)。
+    戻り値 (event, grade)。skill: sharp/average。careGood加点は grade<=2"""
+    if skill == "sharp":
+        tbl = [0, 0, 0, 0, 1, 1, 1, 2, 3]  # P45/G30/G15/F10
+    else:
+        tbl = [0, 1, 1, 2, 2, 3, 3, 3, 3]
+    grade = tbl[rng() % len(tbl)]
+    if c.en < TRAIN_OVERWORK_EN:
+        c.hp = c.hp - 5 if c.hp > 5 else 1
+        c.ha = c.ha - 10 if c.ha > 10 else 0
+        c.action = "IDLE"
+        return ("OVERWORK", grade)
+    c.en = c.en - TRAIN_ENERGY_COST if c.en >= TRAIN_ENERGY_COST else 0
+    c.hu = min(100, c.hu + TRAIN_HUNGER_COST)
+    c.ha = c.ha - TRAIN_HAPPINESS_COST if c.ha >= TRAIN_HAPPINESS_COST else 0
+    if grade == 4:
+        c.ha = c.ha - 3 if c.ha > 3 else 0
+        c.action = "IDLE"
+        return ("TR:FLYING", grade)
+    if grade == 3:
+        c.action = "IDLE"
+        return ("TR:FAIL", grade)
+    raw = c.species % 12
+    target = APTITUDE[raw][0] if (rng() % 100) < TRAIN_AUTO_P else APTITUDE[raw][1]
+    if grade == 0:
+        gain = 5
+        c.ha = min(100, c.ha + 15)
+    elif grade == 1:
+        gain = 4 + (rng() % 2)
+        c.ha = min(100, c.ha + 15)
+    else:
+        gain = 2 + (rng() % 2)
+    _add_trait(c, target, gain)
+    c.habit[1] = min(100, c.habit[1] + 20)
+    c.action = "PLAY"
+    return (["TR:PERFECT!", "TR:GREAT!", "TR:SUCCESS"][grade], grade)
+
+
+# --- life/evo.h (進化判定) ---
+EGG_AGE_MAX = 300
+LARVA_AGE_MAX = 1800  # 進化判定点 (テンポ圧縮で7200→1800)
+EVO_TABLE = [  # [rank][trait] -> morph
+    [5, 1, 10, 2],   # S
+    [8, 4, 6, 7],    # A
+    [0, 9, 11, 0],   # B
+    [3, 3, 9, 3],    # C
+]
+
+
+def rank_of(score: int) -> int:
+    """FW evo::rankOf (テンポ圧縮に合わせた縮小閾値): S>=15 A>=5 B>=-5"""
+    return 0 if score >= 15 else 1 if score >= 5 else 2 if score >= -5 else 3
+
+
+def rank_of_old(score: int) -> int:
+    """旧閾値 (卵10分/幼生110分時代): S>=30 A>=10 B>=-10 (比較用)"""
+    return 0 if score >= 30 else 1 if score >= 10 else 2 if score >= -10 else 3
+
+
+def score_of(good: int, miss: int, ow: int, bonded: int = 0, rival: int = 0) -> int:
+    return good * 2 - miss * 3 - ow * 5 + bonded * 4 - rival * 2
+
+
+def dom_trait(c: Creature) -> int:
+    best, m = 0, c.in_
+    if c.ag > m:
+        m, best = c.ag, 1
+    if c.cu > m:
+        m, best = c.cu, 2
+    if c.so > m:
+        m, best = c.so, 3
+    return best
+
+
+def simulate_care(window_sec: int, check_min: int, inspect_per_check: int,
+                  skill: str, seed: int, feed_hu: int = 50, play_ha: int = 60,
+                  clean_cl: int = 60) -> dict:
+    """窓終端まで「30s tick + プレイヤーがcheck_min毎に世話」を回して
+    お世話カウンタと進化rankを返す (FW経済の再現)。"""
+    R = random.Random(seed)
+
+    def rng() -> int:
+        return R.getrandbits(32)  # esp_random()相当 (uint32一様)
+
+    c = Creature(tr=(40, 40, 20, 40))
+    good = miss = ow = 0
+    t = 0
+    check_every = check_min * 60
+    while t < window_sec:
+        c.action = ai_decide(c, peers=0)
+        creature_tick(c)
+        if c.hu >= 95:
+            miss += 1
+        t += 30
+        if t % check_every == 0:
+            if c.hu > feed_hu:
+                if ui_feed(c) == "FEED_OK":
+                    good += 1
+            if c.ha < play_ha:
+                if ui_play(c) == "PLAY_OK":
+                    good += 1
+            if c.cl < clean_cl:
+                if ui_clean(c) == "CLEAN_OK":
+                    good += 1
+            for _ in range(inspect_per_check):
+                if c.en < 20 or c.ha < 30:
+                    break
+                ev, grade = ui_inspect(c, rng, skill)
+                if ev == "OVERWORK":
+                    ow += 1
+                elif grade <= 2:
+                    good += 1
+    sc = score_of(good, miss, ow)
+    return {"good": good, "miss": miss, "ow": ow, "score": sc,
+            "rank": "SABC"[rank_of(sc)], "trait": dom_trait(c)}
+
+
+def cmd_evo_rank(trials: int, seed: int) -> None:
+    styles = [  # (名前, チェック間隔min, 1回の検査数, 腕前, 餌/遊び/掃除の閾値)
+        ("放置(60分毎・餌のみ)", 60, 0, "average", 70, 40, 40),
+        ("カジュアル(30分毎)", 30, 0, "average", 50, 60, 60),
+        ("普通(15分毎+検査)", 15, 1, "average", 50, 60, 60),
+        ("熱心(5分毎+検査)", 5, 1, "sharp", 50, 60, 60),
+    ]
+    windows = [(300, "卵直後5分"), (1800, "30分(採用窓)"), (7200, "2h(旧窓)")]
+    print("== 進化rank: お世話カデンス x 判定窓 (FW経済sim, %d試行平均) ==" % trials)
+    print(" score = good*2 - miss*3 - ow*5 / 新閾値 S>=15 A>=5 B>=-5 (採用) / 旧 S>=30 A>=10 B>=-10")
+    print(f"{'プレイヤー':22}{'窓':14}{'good':>5}{'miss':>5}{'ow':>4}{'score':>6}"
+          f"{'新閾値':>9}{'旧閾値':>8}  分布(新)")
+    for name, chk, insp, skill, hu, ha, cl in styles:
+        for w, wname in windows:
+            gr = {"good": 0, "miss": 0, "ow": 0, "score": 0}
+            ranks = {}
+            ranks2 = {}
+            for i in range(trials):
+                r = simulate_care(w, chk, insp, skill, seed * 1000 + i, hu, ha, cl)
+                for k in gr:
+                    gr[k] += r[k]
+                ranks[r["rank"]] = ranks.get(r["rank"], 0) + 1
+                r2 = "SABC"[rank_of_old(r["score"])]
+                ranks2[r2] = ranks2.get(r2, 0) + 1
+            sc = gr["score"] // trials
+            dist = " ".join(f"{k}{ranks.get(k, 0)*100//trials}%" for k in "SABC" if ranks.get(k, 0))
+            d2 = " ".join(f"{k}{ranks2.get(k, 0)*100//trials}%" for k in "SABC" if ranks2.get(k, 0))
+            print(f"{name:22}{wname:14}{gr['good']//trials:5d}{gr['miss']//trials:5d}"
+                  f"{gr['ow']//trials:4d}{sc:6d}{'SABC'[rank_of(sc)]:>9}{'SABC'[rank_of_old(sc)]:>8}"
+                  f"  {dist} | {d2}")
+    print()
+    print(" 採用形: 卵300s/幼生1800s。進化窓30分で 放置=B / カジュアル=B / 普通=A / 熱心=S と4段階が機能")
+    print(" 旧窓2hは同じカデンスで good が約4倍になり、旧閾値(30/10)でも普通がSに張り付いていた")
+
 
 
 def ui_play(c: Creature) -> str:
@@ -415,7 +584,7 @@ def cmd_life(days: float = 3.0, seed: int = 1) -> None:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="InkLife FW balance simulator")
     ap.add_argument("cmd", nargs="?", default="all",
-                    choices=["all", "train-dist", "grind", "fight", "life"])
+                    choices=["all", "train-dist", "grind", "fight", "life", "evo-rank"])
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--sessions", type=int, default=200)
     ap.add_argument("--trials", type=int, default=20000)
@@ -432,6 +601,9 @@ def main(argv=None) -> int:
         print()
     if a.cmd in ("all", "life"):
         cmd_life(a.days, a.seed)
+    if a.cmd in ("all", "evo-rank"):
+        print()
+        cmd_evo_rank(a.sessions, a.seed)
     return 0
 
 

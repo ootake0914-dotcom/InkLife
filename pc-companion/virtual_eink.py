@@ -11,7 +11,8 @@ import math
 import time
 from typing import List, Tuple
 import pyray as rl
-from inkparser import CreatureState, base_morph_of, fuse_shown_gears, normalize_action, sleep_head_off, zone_of
+from inkparser import (CreatureState, base_morph_of, fuse_shown_gears, normalize_action, sleep_head_off,
+                       zone_of, EGG_AGE_MAX, LARVA_AGE_MAX, GROWTH_SEC_PER_PX)
 from voxel_art import ART_DB
 
 EPD_W = 296
@@ -157,7 +158,7 @@ class VirtualEInk:
             return
 
         # 成長サイズ: 64px〜96px (標本窓 ox=4, oy=16 に中央寄せ。FWと同一式)
-        dst = min(96, 64 + state.age_sec // 270)
+        dst = min(96, 64 + state.age_sec // GROWTH_SEC_PER_PX)
         ox = 4 + (96 - dst) // 2
         oy = 16 + (96 - dst) // 2
 
@@ -174,7 +175,7 @@ class VirtualEInk:
         # キメラパーツの追加 (睡眠時はHEAD装備だけ追従オフセット。FW sprite()と同一)
         # 早期形態 (タマゴ/幼生) は純血固定でパーツなし (FW早期returnと同一)
         asleep = (normalize_action(state.action) == "SLEEP" or state.mood == "SLEEPY")
-        effective_gears = [] if state.age_sec < 7200 else fuse_shown_gears(state.fuse, mid, raw)
+        effective_gears = [] if state.age_sec < LARVA_AGE_MAX else fuse_shown_gears(state.fuse, mid, raw)
         for gid in effective_gears:
             if gid in (0, 4, 8, 11):
                 # 手続き型
@@ -208,22 +209,25 @@ class VirtualEInk:
                     # breakしない: ペア物 (耳L/R・髭L/R) は同gearで2行ある
 
         # イベント重ねは最前面 (FW sprite()と同一順序: うんち→王冠→帽子)
-        # うんちは白抜きハロー付き (尻尾・装備に埋もれず前景に見せる)
+        # うんちは型抜きハロー付き (FW overlay96sHaloと同一。白い箱に見せない)
+        hl_p = max(1, 2 * dst // 96)
         if state.cleanliness < 50:
             if "ink_poop_1" in ART_DB.frames:
-                self.fill_rect(ox + 64 * dst // 96, oy + 71 * dst // 96,
-                               max(1, 20 * dst // 96), max(1, 18 * dst // 96), False)
-                self._draw_overlay_96("ink_poop_1", ox, oy, dst)
+                self._draw_overlay_96_halo("ink_poop_1", ox, oy, dst, 100, hl_p)
             else:
                 self._draw_poop_96(ox, oy, dst, 78, 84, 6, 5)  # フォールバック旧ドット
         if state.cleanliness < 25:
             if "ink_poop_2" in ART_DB.frames:
-                self.fill_rect(ox + 57 * dst // 96, oy + 74 * dst // 96,
-                               max(1, 20 * dst // 96), max(1, 18 * dst // 96), False)
-                self._draw_overlay_96("ink_poop_2", ox, oy, dst)
+                self._draw_overlay_96_halo("ink_poop_2", ox, oy, dst, 100, hl_p)
             else:
                 self._draw_poop_96(ox, oy, dst, 68, 88, 5, 4)
-        hk = 65 if 600 <= state.age_sec < 7200 else 100  # FW isLarvaStage基準 (卵は100)
+        hk = 65 if EGG_AGE_MAX <= state.age_sec < LARVA_AGE_MAX else 100  # FW isLarvaStage基準 (卵は100)
+        # 長老マーク (12h〜): 頭上の星屑2つ (FW eventOverlaysのdot()と同一座標)
+        if state.age_sec >= 43200:
+            SCm = lambda v: (v * dst) // 96
+            for (mx, my, mw, mh) in ((18, 10, 5, 1), (16, 8, 1, 5), (74, 6, 5, 1), (76, 4, 1, 5)):
+                self.fill_rect(ox + SCm(mx), oy + SCm(my),
+                               max(1, SCm(mw)), max(1, SCm(mh)), True)
         crown = len(self.logs) > 0 and self.logs[0].endswith("TR:PERFECT!")
         if crown:
             self._draw_overlay_96("art_test_crown", ox, oy, dst, hk)
@@ -269,6 +273,29 @@ class VirtualEInk:
             self.draw_pixel(x0 - y, y0 + x)
             self.draw_pixel(x0 + y, y0 - x)
             self.draw_pixel(x0 - y, y0 - x)
+
+    def _draw_overlay_96_halo(self, frame_name: str, ox: int, oy: int, dst: int, k: int = 100, hl: int = 1) -> bool:
+        """シルエット型抜き白ハロー付き96空間重ね (FW overlay96sHaloと同一)。
+        黒画素をhl px膨らませた白→黒の2パス。矩形ハローの白い箱を解消する"""
+        fb = ART_DB.frames.get(frame_name)
+        if not fb or len(fb) < 1152:
+            return False
+        for black_pass in (False, True):
+            for y in range(96):
+                row = y * 12
+                for x in range(96):
+                    if (fb[row + (x >> 3)] >> (x & 7)) & 1:
+                        sx = 48 + (x - 48) * k // 100
+                        sy = 48 + (y - 48) * k // 100
+                        dx = ox + sx * dst // 96
+                        dy = oy + sy * dst // 96
+                        if black_pass:
+                            self.draw_pixel(dx, dy, True)
+                        else:
+                            for oyy in range(-hl, hl + 1):
+                                for oxx in range(-hl, hl + 1):
+                                    self.draw_pixel(dx + oxx, dy + oyy, False)
+        return True
 
     def _draw_overlay_96(self, frame_name: str, ox: int, oy: int, dst: int, k: int = 100) -> bool:
         """96空間フルフレーム透過重ね (FW overlay96sと同一)。成功時True"""
@@ -370,12 +397,12 @@ class VirtualEInk:
                 self.draw_pixel(x0 + dx, y0 + dy, True)
 
     def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str, age_sec: int = 999999) -> str:
-        # FW screen.h sprite() と同一: 600s未満=タマゴ3段階、7200s未満=幼生5感情
-        if age_sec < 600:
-            if age_sec < 200: return "ink_egg_idle"
-            if age_sec < 400: return "ink_egg_crack"
+        # FW screen.h sprite() と同一: 卵300s=タマゴ3段階(100s毎)、幼生1800s未満=幼生5感情
+        if age_sec < EGG_AGE_MAX:
+            if age_sec < 100: return "ink_egg_idle"
+            if age_sec < 200: return "ink_egg_crack"
             return "ink_egg_hatch"
-        if age_sec < 7200:
+        if age_sec < LARVA_AGE_MAX:
             act = normalize_action(action)
             if act == "SLEEP" or mood == "SLEEPY": return "ink_larva_sleep"
             if act == "EAT": return "ink_larva_eat"
@@ -456,8 +483,8 @@ class VirtualEInk:
         rl.draw_text("SPECIMEN", dest_x + int(6 * S), dest_y + int(4 * S), fs, COLOR_INK)
         rl.draw_text(f"T+{hms}", dest_x + int(236 * S), dest_y + int(4 * S), fs, COLOR_INK)
         # FW morphTag() と同一: 早期形態はEGG/LARVA表示
-        if state.age_sec < 600: morph_tag = "EGG"
-        elif state.age_sec < 7200: morph_tag = "LARVA"
+        if state.age_sec < EGG_AGE_MAX: morph_tag = "EGG"
+        elif state.age_sec < LARVA_AGE_MAX: morph_tag = "LARVA"
         else: morph_tag = f"{state.base_name}-{state.species_id%12:02d}"
         rl.draw_text(f"G{state.generation:02d} {morph_tag}",
                      dest_x + int(6 * S), dest_y + int(116 * S), fs, COLOR_INK)

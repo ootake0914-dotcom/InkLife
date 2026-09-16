@@ -15,7 +15,8 @@ import math
 from collections import deque
 from typing import Dict, List, Tuple, Optional
 import pyray as rl
-from inkparser import ANCHOR_BASE_MAP, fuse_shown_gears, zone_of, normalize_action, sleep_head_off
+from inkparser import (ANCHOR_BASE_MAP, fuse_shown_gears, zone_of, normalize_action, sleep_head_off,
+                       EGG_AGE_MAX, LARVA_AGE_MAX)
 
 # 形態ごとのベースカラーパレット (本体基本色, ハイライト色, 影色, インクライン色)
 MORPH_COLORS = {
@@ -153,10 +154,10 @@ class ChimeraVoxelModel:
         raw = species_id % 12
         mid = ANCHOR_BASE_MAP[raw]
         # 早期形態 (タマゴ/幼生) は純血固定でパーツなし (FW sprite()早期returnと同一)
-        effective_gears = [] if age_sec < 7200 else fuse_shown_gears(fuse, mid, raw)
+        effective_gears = [] if age_sec < LARVA_AGE_MAX else fuse_shown_gears(fuse, mid, raw)
         # FW表記ゆれ対策: 正規化後の行動で鍵を作り、同一絵の無駄再ビルドを防ぐ
         act = normalize_action(action)
-        early = 0 if age_sec >= 7200 else (1 if age_sec >= 600 else 2 + age_sec // 200)
+        early = 0 if age_sec >= LARVA_AGE_MAX else (1 if age_sec >= EGG_AGE_MAX else 2 + age_sec // 100)
         key = f"{species_id}_{mid}_{act}_{mood}_{','.join(map(str, effective_gears))}_{happiness // 25}_{early}"
         if key == self.cache_key and self.voxels:
             return
@@ -386,12 +387,12 @@ class ChimeraVoxelModel:
         return 0.05  # AURA (星・ハイライト): 前面で浮遊
 
     def _resolve_frame_name(self, raw: int, mid: int, action: str, mood: str, age_sec: int = 999999) -> str:
-        # FW screen.h sprite() と同一: 600s未満=タマゴ3段階、7200s未満=幼生5感情
-        if age_sec < 600:
-            if age_sec < 200: return "ink_egg_idle"
-            if age_sec < 400: return "ink_egg_crack"
+        # FW screen.h sprite() と同一: 卵300s=タマゴ3段階(100s毎)、幼生1800s未満=幼生5感情
+        if age_sec < EGG_AGE_MAX:
+            if age_sec < 100: return "ink_egg_idle"
+            if age_sec < 200: return "ink_egg_crack"
             return "ink_egg_hatch"
-        if age_sec < 7200:
+        if age_sec < LARVA_AGE_MAX:
             act = normalize_action(action)
             if act == "SLEEP" or mood == "SLEEPY": return "ink_larva_sleep"
             if act == "EAT": return "ink_larva_eat"
