@@ -9,7 +9,7 @@ Raylib 6.0 (C言語ネイティブ高速 3D エンジン) + Python による本�
 ## 🚀 起動方法
 
 ### 方法 1: ダブルクリックで起動（一番かんたん）
-[`pc-companion/run.bat`](file:///C:/Users/ootak/OneDrive/Desktop/InkLife/pc-companion/run.bat) をダブルクリックするだけです。
+フォルダ内の `run.bat` をダブルクリックするだけです。
 （`uv` がインストールされていれば、依存パッケージを自動解決して爆速で起動します）
 
 ### 方法 2: コマンドラインから起動
